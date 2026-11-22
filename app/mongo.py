@@ -50,6 +50,16 @@ INDEXES: tuple[tuple[str, list[tuple[str, int]], dict[str, Any]], ...] = (
         [("expires_at", ASCENDING)],
         {"expireAfterSeconds": 0, "name": "caregiver_invite_expiry_ttl"},
     ),
+    (
+        "rate_limits",
+        [("expires_at", ASCENDING)],
+        {"expireAfterSeconds": 0, "name": "rate_limit_expiry_ttl"},
+    ),
+    (
+        "refresh_tokens",
+        [("expires_at", ASCENDING)],
+        {"expireAfterSeconds": 0, "name": "refresh_token_expiry_ttl"},
+    ),
 )
 
 

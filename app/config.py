@@ -14,6 +14,11 @@ try:
 
         mongodb_uri: str = ""
         mongodb_database: str = ""
+        jwt_secret: str = ""
+        jwt_issuer: str = "transplantcare"
+        access_token_minutes: int = 15
+        refresh_token_days: int = 30
+        app_env: str = "production"
 
         anthropic_api_key: str = ""
         claude_model: str = "claude-sonnet-4-20250514"
@@ -39,6 +44,11 @@ except Exception:
 
         mongodb_uri: str = ""
         mongodb_database: str = ""
+        jwt_secret: str = ""
+        jwt_issuer: str = "transplantcare"
+        access_token_minutes: int = 15
+        refresh_token_days: int = 30
+        app_env: str = "production"
 
         anthropic_api_key: str = ""
         claude_model: str = "claude-sonnet-4-20250514"

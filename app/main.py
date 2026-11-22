@@ -1,16 +1,30 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 
 from app.config import get_settings
-from app.routers import ai, emergency, food, labs, me, medicines
+from app.mongo import close_mongo, connect_mongo
+from app.routers import ai, auth, emergency, food, labs, me, medicines
 
 settings = get_settings()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await connect_mongo()
+    try:
+        yield
+    finally:
+        await close_mongo()
+
 
 app = FastAPI(
     title="TransplantCare API",
     description="AI, SOS, and food/lab helpers for TransplantCare. Does not replace medical care.",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 origins = (
@@ -27,6 +41,7 @@ app.add_middleware(
 )
 
 app.include_router(me.router)
+app.include_router(auth.router)
 app.include_router(medicines.router)
 app.include_router(food.router)
 app.include_router(labs.router)

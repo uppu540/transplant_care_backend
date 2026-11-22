@@ -1,9 +1,13 @@
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from uuid import uuid4
 
 from app.ai.tools import get_daily_budget
 from app.auth import AuthUser, get_current_user
 from app.db import get_profile_by_user_id, get_supabase
+from app.mongo import get_mongo_database
+from app.rate_limit import rate_limit
 
 router = APIRouter(prefix="/me", tags=["me"])
 
@@ -45,15 +49,31 @@ def clinical_summary(user: AuthUser = Depends(get_current_user)):
 
 
 @router.post("/consent")
-def record_consent(body: ConsentBody, user: AuthUser = Depends(get_current_user)):
-    sb = get_supabase()
-    sb.table("consents").insert(
+async def record_consent(
+    body: ConsentBody,
+    user: AuthUser = Depends(get_current_user),
+    database=Depends(get_mongo_database),
+):
+    now = datetime.now(timezone.utc)
+    user_update = {
+        "consent_version": body.version if body.accepted else None,
+        "consent_at": now if body.accepted else None,
+    }
+    result = await database["users"].update_one(
+        {"_id": user.user_id},
+        {"$set": user_update},
+    )
+    if result.matched_count != 1:
+        raise HTTPException(404, "User account not found")
+    await database["consents"].insert_one(
         {
+            "_id": str(uuid4()),
             "user_id": user.user_id,
             "policy_version": body.version,
             "accepted": body.accepted,
+            "accepted_at": now,
         }
-    ).execute()
+    )
     return {"ok": True}
 
 
@@ -84,7 +104,10 @@ class AcceptInviteBody(BaseModel):
     invite_code: str
 
 
-@router.post("/caregiver/invite")
+@router.post(
+    "/caregiver/invite",
+    dependencies=[Depends(rate_limit("caregiver_invite_create", max_requests=5))],
+)
 def create_caregiver_invite(user: AuthUser = Depends(get_current_user)):
     profile = get_profile_by_user_id(user.user_id)
     sb = get_supabase()
@@ -105,7 +128,10 @@ def create_caregiver_invite(user: AuthUser = Depends(get_current_user)):
     }
 
 
-@router.post("/caregiver/accept")
+@router.post(
+    "/caregiver/accept",
+    dependencies=[Depends(rate_limit("caregiver_invite_accept", max_requests=5))],
+)
 def accept_caregiver_invite(
     body: AcceptInviteBody, user: AuthUser = Depends(get_current_user)
 ):

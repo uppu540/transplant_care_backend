@@ -37,6 +37,15 @@ class UserDocument(MongoDocument):
     consent_at: UTCDateTime | None = None
 
 
+class RefreshTokenDocument(MongoDocument):
+    collection_name: ClassVar[str] = "refresh_tokens"
+    user_id: str
+    token_hash: str
+    issued_at: UTCDateTime
+    expires_at: UTCDateTime
+    revoked_at: UTCDateTime | None = None
+
+
 class ProfileDocument(MongoDocument):
     collection_name: ClassVar[str] = "profiles"
     user_id: str
