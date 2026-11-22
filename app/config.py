@@ -12,6 +12,9 @@ try:
         supabase_jwt_secret: str = ""
         supabase_secret_key: str = ""
 
+        mongodb_uri: str = ""
+        mongodb_database: str = ""
+
         anthropic_api_key: str = ""
         claude_model: str = "claude-sonnet-4-20250514"
 
@@ -33,6 +36,9 @@ except Exception:
         supabase_anon_key: str = ""
         supabase_service_role_key: str = ""
         supabase_jwt_secret: str = ""
+
+        mongodb_uri: str = ""
+        mongodb_database: str = ""
 
         anthropic_api_key: str = ""
         claude_model: str = "claude-sonnet-4-20250514"
