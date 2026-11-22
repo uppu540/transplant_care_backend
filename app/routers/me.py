@@ -9,6 +9,7 @@ from pymongo.errors import DuplicateKeyError
 from app.ai.tools import get_daily_budget
 from app.auth import AuthUser, get_caregiver_user, get_current_user, get_patient_user
 from app.repository import MongoRepository, get_repository
+from app.storage import LabReportStorage, get_lab_report_storage
 from app.rate_limit import rate_limit
 
 router = APIRouter(prefix="/me", tags=["me"])
@@ -275,9 +276,11 @@ async def get_caregiver_patient_view(
 async def delete_account(
     user: AuthUser = Depends(get_patient_user),
     repository: MongoRepository = Depends(get_repository),
+    storage: LabReportStorage = Depends(get_lab_report_storage),
 ):
     profile = await repository.get_profile_by_user_id(user.user_id)
     if not profile:
         raise HTTPException(404, "Profile not found")
+    await storage.delete_patient_files(profile["id"])
     await repository.delete_account(profile["id"], user.user_id)
     return {"ok": True, "note": "Profile and related data deleted."}

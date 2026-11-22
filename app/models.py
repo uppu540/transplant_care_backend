@@ -119,6 +119,9 @@ class LabReportDocument(MongoDocument):
     storage_path: str
     extracted_at: UTCDateTime
     extraction_raw: dict[str, Any] = Field(default_factory=dict)
+    storage_file_id: str | None = None
+    content_type: str | None = None
+    original_filename: str | None = None
 
 
 class LabValueDocument(MongoDocument):

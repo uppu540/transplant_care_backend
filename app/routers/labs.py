@@ -3,11 +3,20 @@ from __future__ import annotations
 from datetime import datetime, date, timezone
 import re
 from typing import Any
+from urllib.parse import quote
+
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
+from pymongo.errors import PyMongoError
+from starlette.responses import Response
 
 from app.auth import AuthUser, get_patient_user
 from app.repository import MongoRepository, get_repository
+from app.storage import (
+    MAX_LAB_REPORT_BYTES,
+    LabReportStorage,
+    get_lab_report_storage,
+)
 
 router = APIRouter(prefix="/labs", tags=["labs"])
 
@@ -100,6 +109,7 @@ async def extract_labs(
     report_text: str | None = Form(None),
     user: AuthUser = Depends(get_patient_user),
     repository: MongoRepository = Depends(get_repository),
+    storage: LabReportStorage = Depends(get_lab_report_storage),
 ):
     """
     Extract lab report values from uploaded report file or text.
@@ -112,13 +122,31 @@ async def extract_labs(
 
     content_str = ""
     filename = "manual_entry.txt"
+    storage_file_id = None
+    content_type = None
     if file is not None:
-        filename = file.filename or "upload.txt"
-        file_bytes = await file.read()
-        try:
-            content_str = file_bytes.decode("utf-8", errors="ignore")
-        except Exception:
-            content_str = ""
+        filename = (file.filename or "upload.txt").replace("\\", "/").rsplit("/", 1)[-1]
+        content_type = file.content_type or "application/octet-stream"
+        allowed_types = {
+            "application/octet-stream",
+            "application/pdf",
+            "image/jpeg",
+            "image/png",
+            "image/webp",
+            "text/plain",
+        }
+        if content_type not in allowed_types:
+            raise HTTPException(status_code=415, detail="Unsupported lab report file type")
+        file_bytes = await file.read(MAX_LAB_REPORT_BYTES + 1)
+        if len(file_bytes) > MAX_LAB_REPORT_BYTES:
+            raise HTTPException(status_code=413, detail="Lab report file is too large")
+        storage_file_id = await storage.upload(
+            patient_id=pid,
+            filename=filename,
+            content_type=content_type,
+            content=file_bytes,
+        )
+        content_str = file_bytes.decode("utf-8", errors="ignore")
     elif report_text:
         content_str = report_text
 
@@ -126,16 +154,24 @@ async def extract_labs(
 
     # Save report
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    report = await repository.insert_patient_record(
-        "lab_reports",
-        pid,
-        {
-            "collected_at": today,
-            "storage_path": f"reports/{pid}/{filename}",
-            "extracted_at": datetime.now(timezone.utc),
-            "extraction_raw": {"filename": filename, "values_count": len(extracted)},
-        },
-    )
+    try:
+        report = await repository.insert_patient_record(
+            "lab_reports",
+            pid,
+            {
+                "collected_at": today,
+                "storage_path": f"reports/{pid}/{filename}",
+                "extracted_at": datetime.now(timezone.utc),
+                "extraction_raw": {"filename": filename, "values_count": len(extracted)},
+                "storage_file_id": storage_file_id,
+                "content_type": content_type,
+                "original_filename": filename,
+            },
+        )
+    except PyMongoError:
+        if storage_file_id:
+            await storage.delete(storage_file_id)
+        raise
     report_id = report["id"]
 
     saved_values = []
@@ -291,4 +327,40 @@ async def list_reports(
         sort=[("collected_at", -1)],
         limit=30,
     )
+    for report in reps:
+        report.pop("storage_file_id", None)
+        report.pop("content_type", None)
+        report.pop("original_filename", None)
     return {"reports": reps}
+
+
+@router.get("/reports/{report_id}/file")
+async def download_lab_report(
+    report_id: str,
+    user: AuthUser = Depends(get_patient_user),
+    repository: MongoRepository = Depends(get_repository),
+    storage: LabReportStorage = Depends(get_lab_report_storage),
+):
+    profile = await repository.get_profile_by_user_id(user.user_id)
+    if not profile:
+        raise HTTPException(404, "Profile not found")
+    report = await repository.find_one_patient_record(
+        "lab_reports",
+        profile["id"],
+        filters={"_id": report_id},
+    )
+    if not report or not report.get("storage_file_id"):
+        raise HTTPException(404, "Lab report file not found")
+    content, metadata = await storage.download(
+        report["storage_file_id"],
+        profile["id"],
+    )
+    filename = report.get("original_filename") or "lab-report"
+    return Response(
+        content=content,
+        media_type=metadata.get("content_type") or "application/octet-stream",
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
+        },
+    )

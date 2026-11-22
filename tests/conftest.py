@@ -3,10 +3,13 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 import pytest
+from mongomock import gridfs
 from mongomock_motor import AsyncMongoMockClient
 
 from app.mongo import ensure_indexes
 from app.repository import MongoRepository
+
+gridfs.enable_gridfs_integration()
 
 
 @pytest.fixture
