@@ -105,7 +105,10 @@ def get_mongo_client() -> AsyncIOMotorClient:
 def get_mongo_database() -> AsyncIOMotorDatabase:
     settings = get_settings()
     if not settings.mongodb_database:
-        raise RuntimeError("MONGODB_DATABASE is not configured")
+        raise RuntimeError(
+            "MONGODB_DATABASE is not configured; set it in the project .env "
+            "or process environment"
+        )
     return get_mongo_client()[settings.mongodb_database]
 
 
