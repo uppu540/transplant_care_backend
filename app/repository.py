@@ -113,6 +113,16 @@ class MongoRepository:
             await self._database["profiles"].find_one({"_id": patient_id})
         )
 
+    async def update_profile_by_user_id(
+        self,
+        user_id: str,
+        updates: dict[str, Any],
+    ) -> Any:
+        return await self._database["profiles"].update_one(
+            {"user_id": user_id},
+            {"$set": updates},
+        )
+
     async def update_profile_role(self, user_id: str, role: str) -> Any:
         return await self._database["profiles"].update_one(
             {"user_id": user_id},
@@ -253,6 +263,34 @@ class MongoRepository:
         await self._database[collection_name].insert_one(payload)
         return _serialize(payload) or {}
 
+    async def replace_patient_records(
+        self,
+        collection_name: str,
+        patient_id: str,
+        documents: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        self._validate_patient_collection(collection_name)
+        model = PATIENT_DOCUMENT_MODELS[collection_name]
+        prepared = []
+        now = datetime.now(timezone.utc)
+        for document in documents:
+            payload = dict(document)
+            payload.pop("_id", None)
+            payload["patient_id"] = patient_id
+            payload.setdefault("created_at", now)
+            prepared.append(_validate_document(model, payload))
+
+        await self._database[collection_name].delete_many(
+            {"patient_id": patient_id}
+        )
+        if not prepared:
+            return []
+        result = await self._database[collection_name].insert_many(prepared)
+        return [
+            _serialize({**document, "_id": inserted_id}) or {}
+            for document, inserted_id in zip(prepared, result.inserted_ids)
+        ]
+
     async def upsert_patient_record(
         self,
         collection_name: str,
@@ -321,6 +359,18 @@ class MongoRepository:
         return await self._database[collection_name].delete_one(
             {"_id": record_id, "patient_id": patient_id}
         )
+
+    async def delete_patient_records(
+        self,
+        collection_name: str,
+        patient_id: str,
+        filters: dict[str, Any],
+    ) -> Any:
+        self._validate_patient_collection(collection_name)
+        query = dict(filters)
+        query.pop("patient_id", None)
+        query["patient_id"] = patient_id
+        return await self._database[collection_name].delete_many(query)
 
     async def insert_consent(self, consent: dict[str, Any]) -> None:
         await self._database["consents"].insert_one(

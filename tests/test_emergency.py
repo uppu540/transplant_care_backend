@@ -116,6 +116,8 @@ def test_sos_trigger_with_contacts_and_cancel(
         )
     )
     assert result["dial_uri"] == "tel:+919811111111"
+    assert result["delivery_status"] == "dry_run"
+    assert result["event"][0]["status"] == "dry_run"
     assert result["first_contact"]["full_name"] == "Caregiver Mom"
     assert len(result["sms_results"]) == 2
     assert len(result["whatsapp_urls"]) == 2
@@ -134,3 +136,44 @@ def test_sos_trigger_with_contacts_and_cancel(
     )
     assert len(events) == 1
     assert events[0]["status"] == "cancelled"
+
+
+def test_sos_reports_failed_delivery(
+    mongo_repository,
+    profile_factory,
+    monkeypatch,
+):
+    from app.routers import emergency
+
+    monkeypatch.setattr(
+        emergency,
+        "send_sms",
+        lambda phone, message: {"ok": False, "error": "provider unavailable"},
+    )
+    user_id = "user-sos-failed"
+    profile = profile_factory(user_id, full_name="Ananya Sharma")
+    asyncio.run(
+        mongo_repository.insert_patient_record(
+            "emergency_contacts",
+            profile["id"],
+            {
+                "full_name": "Caregiver Mom",
+                "phone": "+919811111111",
+                "relation": "Mother",
+                "sort_order": 0,
+            },
+        )
+    )
+
+    result = asyncio.run(
+        sos_trigger(
+            SosBody(symptoms="Chest pain"),
+            user=AuthUser(user_id=user_id),
+            repository=mongo_repository,
+        )
+    )
+
+    assert result["delivery_status"] == "failed"
+    assert result["sms_results"] == [
+        {"ok": False, "error": "provider unavailable"}
+    ]

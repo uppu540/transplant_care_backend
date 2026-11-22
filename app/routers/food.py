@@ -1,3 +1,5 @@
+from datetime import date, datetime, time, timedelta, timezone
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
@@ -91,3 +93,48 @@ async def suggestions(
         "ideas": ideas,
         "disclaimer": "Suggestions are informational only — follow your doctor's diet plan.",
     }
+
+
+@router.get("/logs")
+async def list_food_logs(
+    day: date | None = None,
+    limit: int = 100,
+    user: AuthUser = Depends(get_patient_user),
+    repository: MongoRepository = Depends(get_repository),
+):
+    if limit < 1 or limit > 500:
+        raise HTTPException(422, "Limit must be between 1 and 500")
+    profile = await repository.get_profile_by_user_id(user.user_id)
+    if not profile:
+        raise HTTPException(404, "Profile not found")
+    filters = None
+    if day is not None:
+        start = datetime.combine(day, time.min, tzinfo=timezone.utc)
+        filters = {"logged_at": {"$gte": start, "$lt": start + timedelta(days=1)}}
+    logs = await repository.find_patient_records(
+        "food_logs",
+        profile["id"],
+        filters=filters,
+        sort=[("logged_at", -1)],
+        limit=limit,
+    )
+    return {"logs": logs}
+
+
+@router.delete("/logs/{log_id}")
+async def delete_food_log(
+    log_id: str,
+    user: AuthUser = Depends(get_patient_user),
+    repository: MongoRepository = Depends(get_repository),
+):
+    profile = await repository.get_profile_by_user_id(user.user_id)
+    if not profile:
+        raise HTTPException(404, "Profile not found")
+    result = await repository.delete_patient_record(
+        "food_logs",
+        profile["id"],
+        log_id,
+    )
+    if result.deleted_count != 1:
+        raise HTTPException(404, "Food log not found")
+    return {"ok": True, "log_id": log_id}

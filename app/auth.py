@@ -19,6 +19,7 @@ class AuthUser:
     user_id: str
     email: str | None = None
     role: str = "patient"
+    has_consent: bool = False
 
 
 def create_access_token(
@@ -101,7 +102,7 @@ async def get_current_user(
     user_record = await repository.get_user(user_id)
     if not user_record:
         raise HTTPException(status_code=401, detail="Account no longer exists")
-    if request.url.path not in ("/me/consent", "/auth/logout") and (
+    if request.url.path not in ("/me/consent", "/me/status", "/auth/logout") and (
         not user_record.get("consent_version") or not user_record.get("consent_at")
     ):
         raise HTTPException(
@@ -113,6 +114,7 @@ async def get_current_user(
         user_id=user_id,
         email=payload.get("email"),
         role=user_record.get("role", payload.get("role", "patient")),
+        has_consent=bool(user_record.get("consent_version") and user_record.get("consent_at")),
     )
 
 

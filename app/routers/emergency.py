@@ -1,5 +1,8 @@
+import asyncio
+import logging
 from urllib.parse import quote
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
@@ -9,6 +12,7 @@ from app.repository import MongoRepository, get_repository
 from app.services.sms import send_sms
 
 router = APIRouter(tags=["emergency"])
+logger = logging.getLogger(__name__)
 
 
 class DoctorPayload(BaseModel):
@@ -19,6 +23,14 @@ class SosBody(BaseModel):
     lat: float | None = None
     lng: float | None = None
     symptoms: str | None = None
+
+
+async def _send_sms_safely(phone: str, message: str) -> dict:
+    try:
+        return await run_in_threadpool(send_sms, phone, message)
+    except httpx.HTTPError as error:
+        logger.warning("SOS SMS provider request failed: %s", type(error).__name__)
+        return {"ok": False, "error": "SMS provider unavailable"}
 
 
 async def _build_doctor_text(
@@ -109,14 +121,30 @@ async def sos_trigger(
             "lat": body.lat,
             "lng": body.lng,
             "symptoms": body.symptoms,
-            "status": "sent",
+            "status": "pending",
         },
     )
 
-    sms_results = [
-        await run_in_threadpool(send_sms, contact["phone"], message)
-        for contact in contacts
-    ]
+    sms_results = await asyncio.gather(
+        *(_send_sms_safely(contact["phone"], message) for contact in contacts)
+    )
+    delivered_count = sum(1 for result in sms_results if result.get("ok"))
+    delivery_status = (
+        "sent"
+        if delivered_count == len(sms_results)
+        else "partial"
+        if delivered_count
+        else "failed"
+    )
+    if any(result.get("dry_run") for result in sms_results):
+        delivery_status = "dry_run"
+    await repository.update_patient_record(
+        "sos_events",
+        patient_id,
+        event["id"],
+        {"status": delivery_status},
+    )
+    event["status"] = delivery_status
     whatsapp_urls = []
     for contact in contacts:
         phone = contact["phone"].lstrip("+").replace(" ", "")
@@ -131,6 +159,7 @@ async def sos_trigger(
     return {
         "event": [event],
         "sms_results": sms_results,
+        "delivery_status": delivery_status,
         "whatsapp_urls": whatsapp_urls,
         "dial_uri": f"tel:{first['phone']}",
         "first_contact": first,

@@ -94,11 +94,16 @@ async def _issue_session(user: dict, repository: MongoRepository) -> dict:
             "revoked_at": None,
         }
     )
+    profile = await repository.get_profile_by_user_id(user["_id"])
     return {
         "access_token": access_token,
         "refresh_token": refresh_token,
         "token_type": "bearer",
         "expires_in": settings.access_token_minutes * 60,
+        "has_consent": bool(user.get("consent_version") and user.get("consent_at")),
+        "onboarding_complete": (
+            profile.get("onboarding_complete", True) if profile else False
+        ),
     }
 
 
@@ -133,6 +138,7 @@ async def register(
             "user_id": user_id,
             "full_name": full_name,
             "role": body.role,
+            "onboarding_complete": False,
         }
     )
     session = await _issue_session(user, repository)

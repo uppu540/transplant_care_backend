@@ -96,6 +96,7 @@ def test_caregiver_flow_end_to_end(
     )
     assert view["read_only"] is True
     assert view["patient"]["full_name"] == "Arjun Patel"
+    assert view["patient"]["doctor_whatsapp"] == "+919876500000"
     assert len(view["medicines"]) == 1
     assert view["budget"]["limits_set"] is True
     assert view["budget"]["limits"]["potassium_mg"] == 2500

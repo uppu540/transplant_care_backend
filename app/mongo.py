@@ -17,6 +17,11 @@ INDEXES: tuple[tuple[str, list[tuple[str, int]], dict[str, Any]], ...] = (
         {"unique": True, "name": "profiles_user_id_unique"},
     ),
     (
+        "dietary_limits",
+        [("patient_id", ASCENDING)],
+        {"unique": True, "name": "dietary_limits_patient_unique"},
+    ),
+    (
         "emergency_contacts",
         [("patient_id", ASCENDING), ("sort_order", ASCENDING)],
         {"unique": True, "name": "emergency_contacts_patient_order_unique"},
@@ -73,6 +78,11 @@ INDEXES: tuple[tuple[str, list[tuple[str, int]], dict[str, Any]], ...] = (
         "rate_limits",
         [("expires_at", ASCENDING)],
         {"expireAfterSeconds": 0, "name": "rate_limit_expiry_ttl"},
+    ),
+    (
+        "refresh_tokens",
+        [("token_hash", ASCENDING)],
+        {"unique": True, "name": "refresh_tokens_hash_unique"},
     ),
     (
         "refresh_tokens",

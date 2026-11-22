@@ -97,7 +97,12 @@ def test_current_user_allows_consented_user_and_consent_route(mongo_repository):
             repository=mongo_repository,
         )
     )
-    assert user == AuthUser(user_id="user-1", email="patient@example.test", role="patient")
+    assert user == AuthUser(
+        user_id="user-1",
+        email="patient@example.test",
+        role="patient",
+        has_consent=True,
+    )
 
     unconsented_id = "consent-pending"
     _create_user(mongo_repository, user_id=unconsented_id)
@@ -175,6 +180,8 @@ def test_register_login_and_single_use_refresh_token(
     )
     assert registered["role"] == "patient"
     assert registered["refresh_token"]
+    assert registered["has_consent"] is False
+    assert registered["onboarding_complete"] is False
 
     user = asyncio.run(mongo_repository.get_user(registered["user_id"]))
     assert user["email"] == "patient@example.test"

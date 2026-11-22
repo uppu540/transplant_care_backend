@@ -1,5 +1,8 @@
 import asyncio
 
+import pytest
+from fastapi import HTTPException
+
 from app.auth import AuthUser
 from app.routers.labs import (
     LabValueInput,
@@ -96,3 +99,76 @@ def test_manual_labs_and_trends(mongo_repository, profile_factory):
 
     reports = asyncio.run(list_reports(user=user, repository=mongo_repository))
     assert len(reports["reports"]) == 2
+
+
+def test_confirming_extracted_labs_replaces_values_for_owned_report(
+    mongo_repository,
+    profile_factory,
+):
+    profile = profile_factory("user-labs-confirm")
+    user = AuthUser(user_id="user-labs-confirm")
+    created = asyncio.run(
+        save_manual_labs(
+            ManualReportInput(
+                collected_at="2026-11-01",
+                values=[
+                    LabValueInput(
+                        analyte="creatinine",
+                        value=1.8,
+                        unit="mg/dL",
+                    )
+                ],
+            ),
+            user=user,
+            repository=mongo_repository,
+        )
+    )
+
+    confirmed = asyncio.run(
+        save_manual_labs(
+            ManualReportInput(
+                collected_at="2026-11-02",
+                report_id=created["report_id"],
+                values=[
+                    LabValueInput(
+                        analyte="creatinine",
+                        value=1.1,
+                        unit="mg/dL",
+                    ),
+                    LabValueInput(
+                        analyte="potassium",
+                        value=4.2,
+                        unit="mEq/L",
+                    ),
+                ],
+            ),
+            user=user,
+            repository=mongo_repository,
+        )
+    )
+    trends = asyncio.run(
+        get_lab_trends(user=user, repository=mongo_repository)
+    )["trends"]
+    reports = asyncio.run(list_reports(user=user, repository=mongo_repository))
+
+    assert confirmed["report_id"] == created["report_id"]
+    assert len(trends["creatinine"]) == 1
+    assert trends["creatinine"][0]["value"] == 1.1
+    assert len(trends["potassium"]) == 1
+    assert len(reports["reports"]) == 1
+
+    profile_factory("user-labs-other")
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(
+            save_manual_labs(
+                ManualReportInput(
+                    report_id=created["report_id"],
+                    values=[
+                        LabValueInput(analyte="creatinine", value=2.0)
+                    ],
+                ),
+                user=AuthUser(user_id="user-labs-other"),
+                repository=mongo_repository,
+            )
+        )
+    assert error.value.status_code == 404

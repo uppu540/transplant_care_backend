@@ -44,6 +44,7 @@ class LabValueInput(BaseModel):
 
 class ManualReportInput(BaseModel):
     collected_at: str | None = None
+    report_id: str | None = None
     values: list[LabValueInput]
 
 
@@ -213,17 +214,41 @@ async def save_manual_labs(
         raise HTTPException(404, "Profile not found")
     pid = profile["id"]
     collected = _utc_datetime(body.collected_at or date.today())
-    report = await repository.insert_patient_record(
-        "lab_reports",
-        pid,
-        {
-            "collected_at": collected,
-            "storage_path": f"reports/{pid}/manual_{collected.date().isoformat()}.json",
-            "extracted_at": datetime.now(timezone.utc),
-            "extraction_raw": {"source": "manual"},
-        },
-    )
-    report_id = report["id"]
+    if body.report_id:
+        report = await repository.find_one_patient_record(
+            "lab_reports",
+            pid,
+            filters={"_id": body.report_id},
+        )
+        if not report:
+            raise HTTPException(404, "Lab report not found")
+        report_id = body.report_id
+        await repository.update_patient_record(
+            "lab_reports",
+            pid,
+            report_id,
+            {
+                "collected_at": collected,
+                "extraction_raw": {"source": "confirmed"},
+            },
+        )
+        await repository.delete_patient_records(
+            "lab_values",
+            pid,
+            {"report_id": report_id},
+        )
+    else:
+        report = await repository.insert_patient_record(
+            "lab_reports",
+            pid,
+            {
+                "collected_at": collected,
+                "storage_path": f"reports/{pid}/manual_{collected.date().isoformat()}.json",
+                "extracted_at": datetime.now(timezone.utc),
+                "extraction_raw": {"source": "manual"},
+            },
+        )
+        report_id = report["id"]
 
     saved = []
     for val_input in body.values:

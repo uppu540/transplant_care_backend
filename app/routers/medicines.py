@@ -1,8 +1,9 @@
 from datetime import datetime, timedelta, timezone
+import re
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 
 from app.auth import AuthUser, get_patient_user
@@ -16,6 +17,83 @@ router = APIRouter(prefix="/medicines", tags=["medicines"])
 class LogDoseBody(BaseModel):
     status: Literal["taken", "skipped"]
     scheduled_at: UTCDateTime
+
+
+class MedicineBody(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    dose: str = Field(min_length=1, max_length=100)
+    schedule_times: list[str] = Field(default_factory=list, max_length=24)
+    notes: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("schedule_times")
+    @classmethod
+    def normalize_schedule_times(cls, values: list[str]) -> list[str]:
+        normalized = []
+        for value in values:
+            clean = value.strip()
+            if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d(?::00)?", clean):
+                raise ValueError("Schedule times must use HH:MM or HH:MM:SS")
+            normalized.append(clean if len(clean) == 8 else f"{clean}:00")
+        return normalized
+
+
+class MedicineUpdateBody(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    dose: str | None = Field(default=None, min_length=1, max_length=100)
+    schedule_times: list[str] | None = Field(default=None, max_length=24)
+    notes: str | None = Field(default=None, max_length=2000)
+    active: bool | None = None
+
+    @field_validator("schedule_times")
+    @classmethod
+    def normalize_schedule_times(
+        cls,
+        values: list[str] | None,
+    ) -> list[str] | None:
+        if values is None:
+            return None
+        return MedicineBody.normalize_schedule_times(values)
+
+
+@router.get("")
+async def list_medicines(
+    include_inactive: bool = False,
+    user: AuthUser = Depends(get_patient_user),
+    repository: MongoRepository = Depends(get_repository),
+):
+    profile = await repository.get_profile_by_user_id(user.user_id)
+    if not profile:
+        raise HTTPException(404, "Profile not found")
+    filters = None if include_inactive else {"active": True}
+    medicines_list = await repository.find_patient_records(
+        "medicines",
+        profile["id"],
+        filters=filters,
+        sort=[("created_at", 1)],
+    )
+    return {"medicines": medicines_list}
+
+
+@router.post("", status_code=201)
+async def create_medicine(
+    body: MedicineBody,
+    user: AuthUser = Depends(get_patient_user),
+    repository: MongoRepository = Depends(get_repository),
+):
+    profile = await repository.get_profile_by_user_id(user.user_id)
+    if not profile:
+        raise HTTPException(404, "Profile not found")
+    medicine = await repository.insert_patient_record(
+        "medicines",
+        profile["id"],
+        {
+            **body.model_dump(),
+            "name": body.name.strip(),
+            "dose": body.dose.strip(),
+            "active": True,
+        },
+    )
+    return {"ok": True, "medicine": medicine}
 
 
 @router.post("/{medicine_id}/log")
@@ -177,3 +255,66 @@ async def check_missed_doses(
             )
 
     return {"ok": True, "missed_doses": missed_alerts}
+
+
+@router.patch("/{medicine_id}")
+async def update_medicine(
+    medicine_id: str,
+    body: MedicineUpdateBody,
+    user: AuthUser = Depends(get_patient_user),
+    repository: MongoRepository = Depends(get_repository),
+):
+    profile = await repository.get_profile_by_user_id(user.user_id)
+    if not profile:
+        raise HTTPException(404, "Profile not found")
+    medicine = await repository.find_one_patient_record(
+        "medicines",
+        profile["id"],
+        filters={"_id": medicine_id},
+    )
+    if not medicine:
+        raise HTTPException(404, "Medicine not found")
+    updates = body.model_dump(exclude_unset=True)
+    if not updates:
+        raise HTTPException(422, "At least one medicine field is required")
+    if "name" in updates and updates["name"] is not None:
+        updates["name"] = updates["name"].strip()
+    if "dose" in updates and updates["dose"] is not None:
+        updates["dose"] = updates["dose"].strip()
+    await repository.update_patient_record(
+        "medicines",
+        profile["id"],
+        medicine_id,
+        updates,
+    )
+    updated = await repository.find_one_patient_record(
+        "medicines",
+        profile["id"],
+        filters={"_id": medicine_id},
+    )
+    return {"medicine": updated}
+
+
+@router.delete("/{medicine_id}")
+async def deactivate_medicine(
+    medicine_id: str,
+    user: AuthUser = Depends(get_patient_user),
+    repository: MongoRepository = Depends(get_repository),
+):
+    profile = await repository.get_profile_by_user_id(user.user_id)
+    if not profile:
+        raise HTTPException(404, "Profile not found")
+    medicine = await repository.find_one_patient_record(
+        "medicines",
+        profile["id"],
+        filters={"_id": medicine_id},
+    )
+    if not medicine:
+        raise HTTPException(404, "Medicine not found")
+    await repository.update_patient_record(
+        "medicines",
+        profile["id"],
+        medicine_id,
+        {"active": False},
+    )
+    return {"ok": True, "medicine_id": medicine_id, "active": False}
