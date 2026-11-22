@@ -2,13 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from functools import lru_cache
 from typing import Any
 
 import jwt
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jwt import PyJWKClient
 
 from app.config import Settings, get_settings
 from app.repository import MongoRepository, get_repository
@@ -21,13 +19,6 @@ class AuthUser:
     user_id: str
     email: str | None = None
     role: str = "patient"
-
-
-@lru_cache
-def get_jwks_client(supabase_url: str) -> PyJWKClient:
-    return PyJWKClient(
-        f"{supabase_url.rstrip('/')}/auth/v1/.well-known/jwks.json"
-    )
 
 
 def create_access_token(
@@ -75,45 +66,6 @@ def _verify_local_token(token: str, settings: Settings) -> dict[str, Any]:
     return payload
 
 
-def _verify_supabase_token(token: str, settings: Settings) -> dict[str, Any]:
-    if not settings.supabase_url:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or expired token",
-        )
-
-    header = jwt.get_unverified_header(token)
-    algorithm = header.get("alg")
-
-    if algorithm == "HS256":
-        if not settings.supabase_jwt_secret:
-            raise HTTPException(
-                status_code=401,
-                detail="Legacy Supabase token verification is not configured",
-            )
-        return jwt.decode(
-            token,
-            settings.supabase_jwt_secret,
-            algorithms=["HS256"],
-            audience="authenticated",
-            issuer=f"{settings.supabase_url.rstrip('/')}/auth/v1",
-        )
-
-    if algorithm in ("ES256", "RS256"):
-        signing_key = get_jwks_client(
-            settings.supabase_url
-        ).get_signing_key_from_jwt(token)
-        return jwt.decode(
-            token,
-            signing_key.key,
-            algorithms=[algorithm],
-            audience="authenticated",
-            issuer=f"{settings.supabase_url.rstrip('/')}/auth/v1",
-        )
-
-    raise HTTPException(status_code=401, detail="Unsupported token algorithm")
-
-
 async def get_current_user(
     request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(security),
@@ -133,11 +85,7 @@ async def get_current_user(
         }
     else:
         try:
-            unverified = jwt.decode(token, options={"verify_signature": False})
-            if unverified.get("iss") == settings.jwt_issuer:
-                payload = _verify_local_token(token, settings)
-            else:
-                payload = _verify_supabase_token(token, settings)
+            payload = _verify_local_token(token, settings)
         except HTTPException:
             raise
         except jwt.PyJWTError as exc:

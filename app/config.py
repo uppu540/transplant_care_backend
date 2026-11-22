@@ -6,12 +6,6 @@ try:
     class Settings(BaseSettings):
         model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-        supabase_url: str = ""
-        supabase_anon_key: str = ""
-        supabase_service_role_key: str = ""
-        supabase_jwt_secret: str = ""
-        supabase_secret_key: str = ""
-
         mongodb_uri: str = ""
         mongodb_database: str = ""
         jwt_secret: str = ""
@@ -37,11 +31,6 @@ except Exception:
     from pydantic import BaseSettings  # type: ignore
 
     class Settings(BaseSettings):  # type: ignore
-        supabase_url: str = ""
-        supabase_anon_key: str = ""
-        supabase_service_role_key: str = ""
-        supabase_jwt_secret: str = ""
-
         mongodb_uri: str = ""
         mongodb_database: str = ""
         jwt_secret: str = ""
