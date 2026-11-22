@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import bcrypt
 import jwt
 import pytest
 from fastapi import HTTPException
@@ -204,3 +205,39 @@ def test_register_login_and_single_use_refresh_token(
             )
         )
     assert exc.value.status_code == 401
+
+
+def test_login_migrates_bcrypt_password_hash_to_argon2(
+    mongo_repository,
+    monkeypatch,
+):
+    settings = _settings()
+    monkeypatch.setattr(auth_routes, "get_settings", lambda: settings)
+    password = b"existing-supabase-password"
+    bcrypt_hash = bcrypt.hashpw(password, bcrypt.gensalt()).decode("ascii")
+    asyncio.run(
+        mongo_repository.create_user(
+            {
+                "_id": "migrated-user",
+                "email": "migrated@example.test",
+                "password_hash": bcrypt_hash,
+                "role": "patient",
+                "consent_version": "v1",
+                "consent_at": datetime.now(timezone.utc),
+            }
+        )
+    )
+
+    session = asyncio.run(
+        auth_routes.login(
+            auth_routes.LoginBody(
+                email="migrated@example.test",
+                password=password.decode("ascii"),
+            ),
+            repository=mongo_repository,
+        )
+    )
+
+    migrated_user = asyncio.run(mongo_repository.get_user("migrated-user"))
+    assert session["access_token"]
+    assert migrated_user["password_hash"].startswith("$argon2")

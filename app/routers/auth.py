@@ -7,8 +7,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Literal
 from uuid import uuid4
 
+import bcrypt
 from argon2 import PasswordHasher
-from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
+from argon2.exceptions import InvalidHashError, VerificationError
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from pymongo.errors import DuplicateKeyError
@@ -47,6 +48,22 @@ def _normalize_email(email: str) -> str:
 
 def _hash_refresh_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _verify_password(encoded_hash: str, password: str) -> bool:
+    try:
+        if encoded_hash.startswith(("$2a$", "$2b$", "$2y$")):
+            return bcrypt.checkpw(password.encode("utf-8"), encoded_hash.encode("ascii"))
+        password_hasher.verify(encoded_hash, password)
+        return True
+    except (ValueError, VerificationError, InvalidHashError):
+        return False
+
+
+def _password_needs_rehash(encoded_hash: str) -> bool:
+    return not encoded_hash.startswith("$argon2") or password_hasher.check_needs_rehash(
+        encoded_hash
+    )
 
 
 def _require_jwt_configuration() -> None:
@@ -135,11 +152,9 @@ async def login(
     user = await repository.get_user_by_email(email)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    try:
-        password_hasher.verify(user["password_hash"], body.password)
-    except (VerifyMismatchError, VerificationError, InvalidHashError):
+    if not _verify_password(user["password_hash"], body.password):
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    if password_hasher.check_needs_rehash(user["password_hash"]):
+    if _password_needs_rehash(user["password_hash"]):
         user["password_hash"] = password_hasher.hash(body.password)
         await repository.update_user(
             user["_id"],

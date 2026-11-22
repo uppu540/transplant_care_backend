@@ -89,7 +89,7 @@ class DietaryLimitDocument(MongoDocument):
 class FoodLogDocument(MongoDocument):
     collection_name: ClassVar[str] = "food_logs"
     patient_id: str
-    description: str
+    description: str | None = None
     meal_type: str = "other"
     logged_at: UTCDateTime = Field(default_factory=lambda: datetime.now(timezone.utc))
     potassium_mg: float | None = None
@@ -112,12 +112,20 @@ class FoodCompositionDocument(MongoDocument):
     calories_kcal: float | None = None
 
 
+class GuidanceContentDocument(MongoDocument):
+    collection_name: ClassVar[str] = "guidance_content"
+    slug: str
+    title_en: str
+    body_en: str
+    category: str
+
+
 class LabReportDocument(MongoDocument):
     collection_name: ClassVar[str] = "lab_reports"
     patient_id: str
-    collected_at: UTCDateTime
+    collected_at: UTCDateTime | None = None
     storage_path: str
-    extracted_at: UTCDateTime
+    extracted_at: UTCDateTime | None = None
     extraction_raw: dict[str, Any] = Field(default_factory=dict)
     storage_file_id: str | None = None
     content_type: str | None = None
@@ -134,7 +142,7 @@ class LabValueDocument(MongoDocument):
     ref_low: float | None = None
     ref_high: float | None = None
     out_of_range: bool = False
-    measured_at: UTCDateTime
+    measured_at: UTCDateTime | None = None
 
 
 class EmergencyContactDocument(MongoDocument):
