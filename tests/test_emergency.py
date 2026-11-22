@@ -1,52 +1,50 @@
+import asyncio
+
 import pytest
-from app.db import get_supabase, SupabaseClient, set_supabase_client
-from app.routers.emergency import _build_doctor_text, sos_trigger, sos_cancel, SosBody, DoctorPayload
+from fastapi import HTTPException
+
 from app.auth import AuthUser
+from app.routers.emergency import (
+    SosBody,
+    _build_doctor_text,
+    sos_cancel,
+    sos_trigger,
+)
 
 
-@pytest.fixture(autouse=True)
-def setup_mock_db():
-    client = SupabaseClient("http://mock.supabase.co", "mock-key")
-    set_supabase_client(client)
-    yield client
+def test_doctor_whatsapp_payload_building(mongo_repository, profile_factory):
+    profile = profile_factory(
+        "user-doctor-test",
+        full_name="Ravi Kumar",
+        transplant_date="2025-06-15",
+        doctor_name="Reddy",
+        doctor_whatsapp="+919876543210",
+    )
+    patient_id = profile["id"]
+    asyncio.run(
+        mongo_repository.insert_patient_record(
+            "medicines",
+            patient_id,
+            {"name": "Tacrolimus", "dose": "2mg", "active": True},
+        )
+    )
+    asyncio.run(
+        mongo_repository.insert_patient_record(
+            "lab_values",
+            patient_id,
+            {
+                "report_id": "report-1",
+                "analyte": "creatinine",
+                "value": 1.1,
+                "unit": "mg/dL",
+                "measured_at": "2026-11-20",
+            },
+        )
+    )
 
-
-def test_doctor_whatsapp_payload_building():
-    sb = get_supabase()
-    user_id = "user-doctor-test"
-    prof_res = sb.table("profiles").insert(
-        {
-            "user_id": user_id,
-            "full_name": "Ravi Kumar",
-            "transplant_date": "2025-06-15",
-            "doctor_name": "Reddy",
-            "doctor_whatsapp": "+919876543210",
-        }
-    ).execute()
-    profile = prof_res.data[0]
-
-    # Add active medicines
-    sb.table("medicines").insert(
-        {
-            "patient_id": profile["id"],
-            "name": "Tacrolimus",
-            "dose": "2mg",
-            "active": True,
-        }
-    ).execute()
-
-    # Add recent lab
-    sb.table("lab_values").insert(
-        {
-            "patient_id": profile["id"],
-            "analyte": "creatinine",
-            "value": 1.1,
-            "unit": "mg/dL",
-            "measured_at": "2026-11-20",
-        }
-    ).execute()
-
-    wa_url, text = _build_doctor_text(profile, "Mild ankle swelling")
+    wa_url, text = asyncio.run(
+        _build_doctor_text(profile, "Mild ankle swelling", mongo_repository)
+    )
     assert "https://wa.me/919876543210?text=" in wa_url
     assert "Dr. Reddy" in text
     assert "Ravi Kumar" in text
@@ -56,71 +54,83 @@ def test_doctor_whatsapp_payload_building():
     assert "TransplantCare" in text
 
 
-def test_sos_trigger_no_contacts_raises():
-    sb = get_supabase()
+def test_sos_trigger_no_contacts_raises(mongo_repository, profile_factory):
     user_id = "user-no-contacts"
-    sb.table("profiles").insert(
-        {"user_id": user_id, "full_name": "No Contact Patient"}
-    ).execute()
+    profile_factory(user_id, full_name="No Contact Patient")
 
-    user = AuthUser(user_id=user_id)
-    with pytest.raises(Exception) as exc:
-        sos_trigger(SosBody(lat=17.385, lng=78.486), user=user)
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            sos_trigger(
+                SosBody(lat=17.385, lng=78.486),
+                user=AuthUser(user_id=user_id),
+                repository=mongo_repository,
+            )
+        )
     assert "Add at least one emergency contact" in str(exc.value)
 
 
-def test_sos_trigger_with_contacts_and_cancel():
-    sb = get_supabase()
-    user_id = "user-sos-patient"
-    prof_res = sb.table("profiles").insert(
-        {"user_id": user_id, "full_name": "Ananya Sharma"}
-    ).execute()
-    pid = prof_res.data[0]["id"]
+def test_sos_trigger_with_contacts_and_cancel(
+    mongo_repository,
+    profile_factory,
+    monkeypatch,
+):
+    from app.routers import emergency
 
-    # Add 2 contacts
-    sb.table("emergency_contacts").insert(
-        [
-            {
-                "patient_id": pid,
-                "full_name": "Caregiver Mom",
-                "phone": "+919811111111",
-                "relation": "Mother",
-                "sort_order": 0,
-            },
-            {
-                "patient_id": pid,
-                "full_name": "Brother",
-                "phone": "+919822222222",
-                "relation": "Brother",
-                "sort_order": 1,
-            },
-        ]
-    ).execute()
+    monkeypatch.setattr(
+        emergency,
+        "send_sms",
+        lambda phone, message: {"ok": True, "dry_run": True},
+    )
+    user_id = "user-sos-patient"
+    profile = profile_factory(user_id, full_name="Ananya Sharma")
+    patient_id = profile["id"]
+
+    for contact in (
+        {
+            "full_name": "Caregiver Mom",
+            "phone": "+919811111111",
+            "relation": "Mother",
+            "sort_order": 0,
+        },
+        {
+            "full_name": "Brother",
+            "phone": "+919822222222",
+            "relation": "Brother",
+            "sort_order": 1,
+        },
+    ):
+        asyncio.run(
+            mongo_repository.insert_patient_record(
+                "emergency_contacts",
+                patient_id,
+                contact,
+            )
+        )
 
     user = AuthUser(user_id=user_id)
-    result = sos_trigger(
-        SosBody(lat=17.44, lng=78.38, symptoms="Dizziness and chest pain"),
-        user=user,
+    result = asyncio.run(
+        sos_trigger(
+            SosBody(lat=17.44, lng=78.38, symptoms="Dizziness and chest pain"),
+            user=user,
+            repository=mongo_repository,
+        )
     )
-
     assert result["dial_uri"] == "tel:+919811111111"
     assert result["first_contact"]["full_name"] == "Caregiver Mom"
     assert len(result["sms_results"]) == 2
     assert len(result["whatsapp_urls"]) == 2
     assert "maps.google.com" in result["whatsapp_urls"][0]["wa_url"]
 
-    # Cancel SOS
-    cancel_res = sos_cancel(user=user)
-    assert cancel_res["ok"] is True
-
-    # Verify latest event status is cancelled
-    events = (
-        sb.table("sos_events")
-        .select("*")
-        .eq("patient_id", pid)
-        .order("created_at", desc=True)
-        .execute()
-        .data
+    cancel_result = asyncio.run(
+        sos_cancel(user=user, repository=mongo_repository)
     )
-    assert len(events) >= 1
+    assert cancel_result["ok"] is True
+    events = asyncio.run(
+        mongo_repository.find_patient_records(
+            "sos_events",
+            patient_id,
+            sort=[("created_at", -1)],
+        )
+    )
+    assert len(events) == 1
     assert events[0]["status"] == "cancelled"

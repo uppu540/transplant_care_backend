@@ -8,7 +8,7 @@ from app.ai.red_flags import detect_red_flag, red_flag_message
 from app.ai.system_prompt import SYSTEM_PROMPT
 from app.ai.tools import TOOL_DEFINITIONS, execute_tool
 from app.config import get_settings
-from app.db import get_supabase
+from app.repository import MongoRepository
 
 
 def _call_claude(
@@ -41,10 +41,18 @@ async def run_chat(
     patient_id: str,
     message: str,
     locale: str = "en",
+    repository: MongoRepository,
 ) -> dict[str, Any]:
     if detect_red_flag(message):
         reply = red_flag_message(locale)
-        _persist(patient_id, message, reply, red_flag=True, tools_used=[])
+        await _persist(
+            patient_id,
+            message,
+            reply,
+            red_flag=True,
+            tools_used=[],
+            repository=repository,
+        )
         return {"reply": reply, "red_flag": True, "tools_used": []}
 
     settings = get_settings()
@@ -76,7 +84,14 @@ async def run_chat(
             )
         except Exception as exc:
             fallback = "I could not reach the AI service right now. Please try again or contact your doctor."
-            _persist(patient_id, message, fallback, red_flag=False, tools_used=tools_used)
+            await _persist(
+                patient_id,
+                message,
+                fallback,
+                red_flag=False,
+                tools_used=tools_used,
+                repository=repository,
+            )
             return {"reply": fallback, "red_flag": False, "tools_used": tools_used}
 
         tool_uses = [b for b in content_blocks if b.get("type") == "tool_use"]
@@ -85,7 +100,14 @@ async def run_chat(
             red = detect_red_flag(message) or detect_red_flag(text)
             if red:
                 text = red_flag_message(locale)
-            _persist(patient_id, message, text, red_flag=red, tools_used=tools_used)
+            await _persist(
+                patient_id,
+                message,
+                text,
+                red_flag=red,
+                tools_used=tools_used,
+                repository=repository,
+            )
             return {"reply": text, "red_flag": red, "tools_used": tools_used}
 
         # Append assistant turn then tool results
@@ -96,7 +118,7 @@ async def run_chat(
             tool_id = block.get("id")
             tool_input = block.get("input") or {}
             tools_used.append(name)
-            result = execute_tool(patient_id, name, tool_input)
+            result = await execute_tool(patient_id, name, tool_input, repository)
             tool_results.append(
                 {
                     "type": "tool_result",
@@ -107,27 +129,37 @@ async def run_chat(
         messages.append({"role": "user", "content": tool_results})
 
     fallback = "I could not finish that request. Please try again or contact your doctor."
-    _persist(patient_id, message, fallback, red_flag=False, tools_used=tools_used)
+    await _persist(
+        patient_id,
+        message,
+        fallback,
+        red_flag=False,
+        tools_used=tools_used,
+        repository=repository,
+    )
     return {"reply": fallback, "red_flag": False, "tools_used": tools_used}
 
 
-def _persist(
+async def _persist(
     patient_id: str,
     user_msg: str,
     assistant_msg: str,
     red_flag: bool,
     tools_used: list[str],
+    repository: MongoRepository,
 ) -> None:
-    sb = get_supabase()
-    sb.table("chat_messages").insert(
-        [
-            {"patient_id": patient_id, "role": "user", "content": user_msg},
-            {
-                "patient_id": patient_id,
-                "role": "assistant",
-                "content": assistant_msg,
-                "red_flag": red_flag,
-                "tools_used": tools_used,
-            },
-        ]
-    ).execute()
+    await repository.insert_patient_record(
+        "chat_messages",
+        patient_id,
+        {"role": "user", "content": user_msg},
+    )
+    await repository.insert_patient_record(
+        "chat_messages",
+        patient_id,
+        {
+            "role": "assistant",
+            "content": assistant_msg,
+            "red_flag": red_flag,
+            "tools_used": tools_used,
+        },
+    )

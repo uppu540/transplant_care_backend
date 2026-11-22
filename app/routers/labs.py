@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime, date, timezone
-import json
 import re
 from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 
-from app.auth import AuthUser, get_current_user
-from app.config import get_settings
-from app.db import get_profile_by_user_id, get_supabase
+from app.auth import AuthUser, get_patient_user
+from app.repository import MongoRepository, get_repository
 
 router = APIRouter(prefix="/labs", tags=["labs"])
 
@@ -38,6 +36,21 @@ class LabValueInput(BaseModel):
 class ManualReportInput(BaseModel):
     collected_at: str | None = None
     values: list[LabValueInput]
+
+
+def _utc_datetime(value: str | date | datetime) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, date):
+        parsed = datetime.combine(value, datetime.min.time())
+    else:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = datetime.combine(date.fromisoformat(value), datetime.min.time())
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _extract_from_text(raw_text: str) -> list[dict[str, Any]]:
@@ -85,14 +98,16 @@ def _extract_from_text(raw_text: str) -> list[dict[str, Any]]:
 async def extract_labs(
     file: UploadFile | None = File(None),
     report_text: str | None = Form(None),
-    user: AuthUser = Depends(get_current_user),
+    user: AuthUser = Depends(get_patient_user),
+    repository: MongoRepository = Depends(get_repository),
 ):
     """
     Extract lab report values from uploaded report file or text.
     Grounds values with doctor/reference ranges and flags out-of-range values.
     """
-    profile = get_profile_by_user_id(user.user_id)
-    sb = get_supabase()
+    profile = await repository.get_profile_by_user_id(user.user_id)
+    if not profile:
+        raise HTTPException(404, "Profile not found")
     pid = profile["id"]
 
     content_str = ""
@@ -110,17 +125,18 @@ async def extract_labs(
     extracted = _extract_from_text(content_str)
 
     # Save report
-    today_str = date.today().isoformat()
-    rep_res = sb.table("lab_reports").insert(
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    report = await repository.insert_patient_record(
+        "lab_reports",
+        pid,
         {
-            "patient_id": pid,
-            "collected_at": today_str,
+            "collected_at": today,
             "storage_path": f"reports/{pid}/{filename}",
-            "extracted_at": datetime.now(timezone.utc).isoformat(),
+            "extracted_at": datetime.now(timezone.utc),
             "extraction_raw": {"filename": filename, "values_count": len(extracted)},
-        }
-    ).execute()
-    report_id = rep_res.data[0]["id"] if rep_res.data else "mock-rep-id"
+        },
+    )
+    report_id = report["id"]
 
     saved_values = []
     for item in extracted:
@@ -130,17 +146,17 @@ async def extract_labs(
         out = (low is not None and val < low) or (high is not None and val > high)
         v_row = {
             "report_id": report_id,
-            "patient_id": pid,
             "analyte": item["analyte"],
             "value": val,
             "unit": item.get("unit"),
             "ref_low": low,
             "ref_high": high,
             "out_of_range": out,
-            "measured_at": today_str,
+            "measured_at": today,
         }
-        res = sb.table("lab_values").insert(v_row).execute()
-        saved_values.append(res.data[0] if res.data else v_row)
+        saved_values.append(
+            await repository.insert_patient_record("lab_values", pid, v_row)
+        )
 
     return {
         "ok": True,
@@ -151,25 +167,27 @@ async def extract_labs(
 
 
 @router.post("/manual")
-def save_manual_labs(
+async def save_manual_labs(
     body: ManualReportInput,
-    user: AuthUser = Depends(get_current_user),
+    user: AuthUser = Depends(get_patient_user),
+    repository: MongoRepository = Depends(get_repository),
 ):
-    profile = get_profile_by_user_id(user.user_id)
-    sb = get_supabase()
+    profile = await repository.get_profile_by_user_id(user.user_id)
+    if not profile:
+        raise HTTPException(404, "Profile not found")
     pid = profile["id"]
-    collected = body.collected_at or date.today().isoformat()
-
-    rep_res = sb.table("lab_reports").insert(
+    collected = _utc_datetime(body.collected_at or date.today())
+    report = await repository.insert_patient_record(
+        "lab_reports",
+        pid,
         {
-            "patient_id": pid,
             "collected_at": collected,
-            "storage_path": f"reports/{pid}/manual_{collected}.json",
-            "extracted_at": datetime.now(timezone.utc).isoformat(),
+            "storage_path": f"reports/{pid}/manual_{collected.date().isoformat()}.json",
+            "extracted_at": datetime.now(timezone.utc),
             "extraction_raw": {"source": "manual"},
-        }
-    ).execute()
-    report_id = rep_res.data[0]["id"] if rep_res.data else "mock-rep-id"
+        },
+    )
+    report_id = report["id"]
 
     saved = []
     for val_input in body.values:
@@ -188,46 +206,51 @@ def save_manual_labs(
 
         v_row = {
             "report_id": report_id,
-            "patient_id": pid,
             "analyte": val_input.analyte.lower(),
             "value": val,
             "unit": unit,
             "ref_low": low,
             "ref_high": high,
             "out_of_range": out,
-            "measured_at": val_input.measured_at or collected,
+            "measured_at": _utc_datetime(val_input.measured_at or collected),
         }
-        res = sb.table("lab_values").insert(v_row).execute()
-        saved.append(res.data[0] if res.data else v_row)
+        saved.append(await repository.insert_patient_record("lab_values", pid, v_row))
 
     return {"ok": True, "report_id": report_id, "values": saved}
 
 
 @router.get("/trends")
-def get_lab_trends(
+async def get_lab_trends(
     analyte: str | None = None,
     limit: int = 100,
-    user: AuthUser = Depends(get_current_user),
+    user: AuthUser = Depends(get_patient_user),
+    repository: MongoRepository = Depends(get_repository),
 ):
     """
     Returns time series lab values grouped by analyte with reference ranges
     and out-of-range flags for charting.
     """
-    profile = get_profile_by_user_id(user.user_id)
-    sb = get_supabase()
+    profile = await repository.get_profile_by_user_id(user.user_id)
+    if not profile:
+        raise HTTPException(404, "Profile not found")
     pid = profile["id"]
-
-    query = (
-        sb.table("lab_values")
-        .select("analyte,value,unit,ref_low,ref_high,out_of_range,measured_at")
-        .eq("patient_id", pid)
-        .order("measured_at", desc=False)
-        .limit(limit)
+    filters = {"analyte": analyte.lower()} if analyte else None
+    data = await repository.find_patient_records(
+        "lab_values",
+        pid,
+        filters=filters,
+        projection={
+            "analyte": 1,
+            "value": 1,
+            "unit": 1,
+            "ref_low": 1,
+            "ref_high": 1,
+            "out_of_range": 1,
+            "measured_at": 1,
+        },
+        sort=[("measured_at", 1)],
+        limit=limit,
     )
-    if analyte:
-        query = query.eq("analyte", analyte.lower())
-
-    data = query.execute().data or []
 
     # Group by analyte
     trends: dict[str, list[dict[str, Any]]] = {}
@@ -255,17 +278,17 @@ def get_lab_trends(
 
 
 @router.get("/reports")
-def list_reports(user: AuthUser = Depends(get_current_user)):
-    profile = get_profile_by_user_id(user.user_id)
-    sb = get_supabase()
-    reps = (
-        sb.table("lab_reports")
-        .select("*")
-        .eq("patient_id", profile["id"])
-        .order("collected_at", desc=True)
-        .limit(30)
-        .execute()
-        .data
-        or []
+async def list_reports(
+    user: AuthUser = Depends(get_patient_user),
+    repository: MongoRepository = Depends(get_repository),
+):
+    profile = await repository.get_profile_by_user_id(user.user_id)
+    if not profile:
+        raise HTTPException(404, "Profile not found")
+    reps = await repository.find_patient_records(
+        "lab_reports",
+        profile["id"],
+        sort=[("collected_at", -1)],
+        limit=30,
     )
     return {"reports": reps}

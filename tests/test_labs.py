@@ -1,21 +1,14 @@
-import pytest
-from app.db import get_supabase, SupabaseClient, set_supabase_client
+import asyncio
+
+from app.auth import AuthUser
 from app.routers.labs import (
+    LabValueInput,
+    ManualReportInput,
     _extract_from_text,
     get_lab_trends,
-    save_manual_labs,
     list_reports,
-    ManualReportInput,
-    LabValueInput,
+    save_manual_labs,
 )
-from app.auth import AuthUser
-
-
-@pytest.fixture(autouse=True)
-def setup_mock_db():
-    client = SupabaseClient("http://mock.supabase.co", "mock-key")
-    set_supabase_client(client)
-    yield client
 
 
 def test_heuristic_lab_extraction():
@@ -39,17 +32,11 @@ def test_heuristic_lab_extraction():
     assert analytes["hemoglobin"] == 10.2
 
 
-def test_manual_labs_and_trends():
-    sb = get_supabase()
-    user_id = "user-labs-patient"
-    prof_res = sb.table("profiles").insert(
-        {"user_id": user_id, "full_name": "Kavitha"}
-    ).execute()
-    pid = prof_res.data[0]["id"]
-    user = AuthUser(user_id=user_id)
+def test_manual_labs_and_trends(mongo_repository, profile_factory):
+    profile = profile_factory("user-labs-patient", full_name="Kavitha")
+    user = AuthUser(user_id="user-labs-patient")
 
-    # Insert historical lab report
-    manual_input = ManualReportInput(
+    first = ManualReportInput(
         collected_at="2026-11-01",
         values=[
             LabValueInput(
@@ -68,12 +55,13 @@ def test_manual_labs_and_trends():
             ),
         ],
     )
-    res1 = save_manual_labs(manual_input, user=user)
-    assert res1["ok"] is True
-    assert len(res1["values"]) == 2
+    result_one = asyncio.run(
+        save_manual_labs(first, user=user, repository=mongo_repository)
+    )
+    assert result_one["ok"] is True
+    assert len(result_one["values"]) == 2
 
-    # Insert second lab report
-    manual_input_2 = ManualReportInput(
+    second = ManualReportInput(
         collected_at="2026-11-15",
         values=[
             LabValueInput(
@@ -85,29 +73,26 @@ def test_manual_labs_and_trends():
             ),
             LabValueInput(
                 analyte="potassium",
-                value=5.3,  # Out of range!
+                value=5.3,
                 ref_low=3.5,
                 ref_high=5.0,
                 measured_at="2026-11-15",
             ),
         ],
     )
-    res2 = save_manual_labs(manual_input_2, user=user)
-    assert res2["ok"] is True
+    result_two = asyncio.run(
+        save_manual_labs(second, user=user, repository=mongo_repository)
+    )
+    assert result_two["ok"] is True
 
-    # Query trends
-    trends_res = get_lab_trends(user=user)
-    trends = trends_res["trends"]
-    assert "creatinine" in trends
-    assert "potassium" in trends
+    trends_result = asyncio.run(
+        get_lab_trends(user=user, repository=mongo_repository)
+    )
+    trends = trends_result["trends"]
     assert len(trends["creatinine"]) == 2
     assert len(trends["potassium"]) == 2
+    assert trends["potassium"][0]["out_of_range"] is False
+    assert trends["potassium"][1]["out_of_range"] is True
 
-    # Verify out of range flag
-    k_trends = trends["potassium"]
-    assert k_trends[0]["out_of_range"] is False  # 4.2
-    assert k_trends[1]["out_of_range"] is True   # 5.3
-
-    # List reports
-    reps = list_reports(user=user)
-    assert len(reps["reports"]) == 2
+    reports = asyncio.run(list_reports(user=user, repository=mongo_repository))
+    assert len(reports["reports"]) == 2

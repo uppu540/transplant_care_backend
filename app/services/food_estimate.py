@@ -5,7 +5,7 @@ from typing import Any
 import httpx
 
 from app.config import get_settings
-from app.db import get_supabase
+from app.repository import MongoRepository
 
 ESTIMATE_PROMPT = """
 You estimate nutrients for a kidney transplant patient's meal.
@@ -17,14 +17,22 @@ Do not give medical advice.
 """.strip()
 
 
-def estimate_from_text(text: str) -> dict[str, Any]:
-    sb = get_supabase()
-    foods = (
-        sb.table("food_composition")
-        .select("name_en,potassium_mg,sodium_mg,phosphorus_mg,protein_g,fluid_ml,calories_kcal")
-        .limit(50)
-        .execute()
-    ).data or []
+async def estimate_from_text(
+    text: str,
+    repository: MongoRepository,
+) -> dict[str, Any]:
+    foods = await repository.list_food_composition(
+        projection={
+            "name_en": 1,
+            "potassium_mg": 1,
+            "sodium_mg": 1,
+            "phosphorus_mg": 1,
+            "protein_g": 1,
+            "fluid_ml": 1,
+            "calories_kcal": 1,
+        },
+        limit=50,
+    )
 
     settings = get_settings()
     if not settings.anthropic_api_key:

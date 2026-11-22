@@ -1,12 +1,11 @@
-from __future__ import annotations
-
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
-from app.auth import AuthUser, get_current_user
-from app.db import get_profile_by_user_id, get_supabase
+from app.auth import AuthUser, get_patient_user
+from app.repository import MongoRepository, get_repository
 from app.services.sms import send_sms
 
 router = APIRouter(tags=["emergency"])
@@ -22,27 +21,28 @@ class SosBody(BaseModel):
     symptoms: str | None = None
 
 
-def _build_doctor_text(profile: dict, symptoms: str | None) -> tuple[str, str]:
-    sb = get_supabase()
-    pid = profile["id"]
-    meds = (
-        sb.table("medicines")
-        .select("name,dose")
-        .eq("patient_id", pid)
-        .eq("active", True)
-        .execute()
-    ).data
-    labs = (
-        sb.table("lab_values")
-        .select("analyte,value,unit")
-        .eq("patient_id", pid)
-        .order("measured_at", desc=True)
-        .limit(8)
-        .execute()
-    ).data
-    meds_line = ", ".join(f"{m['name']} {m['dose']}" for m in (meds or [])) or "n/a"
+async def _build_doctor_text(
+    profile: dict,
+    symptoms: str | None,
+    repository: MongoRepository,
+) -> tuple[str, str]:
+    patient_id = profile["id"]
+    meds = await repository.find_patient_records(
+        "medicines",
+        patient_id,
+        filters={"active": True},
+        projection={"name": 1, "dose": 1},
+    )
+    labs = await repository.find_patient_records(
+        "lab_values",
+        patient_id,
+        projection={"analyte": 1, "value": 1, "unit": 1},
+        sort=[("measured_at", -1)],
+        limit=8,
+    )
+    meds_line = ", ".join(f"{medicine['name']} {medicine['dose']}" for medicine in meds) or "n/a"
     labs_line = ", ".join(
-        f"{l['analyte']}={l['value']}{l.get('unit') or ''}" for l in (labs or [])
+        f"{lab['analyte']}={lab['value']}{lab.get('unit') or ''}" for lab in labs
     ) or "n/a"
     text = (
         f"Hello Dr. {profile.get('doctor_name') or ''},\n"
@@ -61,90 +61,101 @@ def _build_doctor_text(profile: dict, symptoms: str | None) -> tuple[str, str]:
 
 
 @router.post("/doctor/whatsapp-payload")
-def doctor_whatsapp(body: DoctorPayload, user: AuthUser = Depends(get_current_user)):
-    profile = get_profile_by_user_id(user.user_id)
-    wa_url, text = _build_doctor_text(profile, body.symptoms)
+async def doctor_whatsapp(
+    body: DoctorPayload,
+    user: AuthUser = Depends(get_patient_user),
+    repository: MongoRepository = Depends(get_repository),
+):
+    profile = await repository.get_profile_by_user_id(user.user_id)
+    if not profile:
+        raise HTTPException(404, "Profile not found")
+    wa_url, text = await _build_doctor_text(profile, body.symptoms, repository)
     return {"wa_url": wa_url, "text": text}
 
 
 @router.post("/sos/trigger")
-def sos_trigger(body: SosBody, user: AuthUser = Depends(get_current_user)):
-    profile = get_profile_by_user_id(user.user_id)
-    sb = get_supabase()
-    contacts = (
-        sb.table("emergency_contacts")
-        .select("*")
-        .eq("patient_id", profile["id"])
-        .order("sort_order")
-        .execute()
-    ).data or []
+async def sos_trigger(
+    body: SosBody,
+    user: AuthUser = Depends(get_patient_user),
+    repository: MongoRepository = Depends(get_repository),
+):
+    profile = await repository.get_profile_by_user_id(user.user_id)
+    if not profile:
+        raise HTTPException(404, "Profile not found")
+    patient_id = profile["id"]
+    contacts = await repository.find_patient_records(
+        "emergency_contacts",
+        patient_id,
+        projection={"full_name": 1, "phone": 1, "relation": 1, "sort_order": 1},
+        sort=[("sort_order", 1)],
+    )
     if not contacts:
         raise HTTPException(400, "Add at least one emergency contact first")
 
-    maps = ""
-    if body.lat is not None and body.lng is not None:
-        maps = f"https://maps.google.com/?q={body.lat},{body.lng}"
-
+    maps = (
+        f"https://maps.google.com/?q={body.lat},{body.lng}"
+        if body.lat is not None and body.lng is not None
+        else ""
+    )
     message = (
         f"SOS from {profile.get('full_name')} (TransplantCare). "
         f"Possible emergency. Location: {maps or 'unavailable'}. "
         f"Symptoms: {body.symptoms or 'n/a'}. Please call them now."
     )
+    event = await repository.insert_patient_record(
+        "sos_events",
+        patient_id,
+        {
+            "lat": body.lat,
+            "lng": body.lng,
+            "symptoms": body.symptoms,
+            "status": "sent",
+        },
+    )
 
-    event = (
-        sb.table("sos_events")
-        .insert(
+    sms_results = [
+        await run_in_threadpool(send_sms, contact["phone"], message)
+        for contact in contacts
+    ]
+    whatsapp_urls = []
+    for contact in contacts:
+        phone = contact["phone"].lstrip("+").replace(" ", "")
+        whatsapp_urls.append(
             {
-                "patient_id": profile["id"],
-                "lat": body.lat,
-                "lng": body.lng,
-                "symptoms": body.symptoms,
-                "status": "sent",
-            }
-        )
-        .execute()
-    ).data
-
-    sms_results = []
-    wa_urls = []
-    for c in contacts:
-        sms_results.append(send_sms(c["phone"], message))
-        phone = c["phone"].lstrip("+").replace(" ", "")
-        wa_urls.append(
-            {
-                "name": c["full_name"],
+                "name": contact["full_name"],
                 "wa_url": f"https://wa.me/{phone}?text={quote(message)}",
             }
         )
 
     first = contacts[0]
-    dial_uri = f"tel:{first['phone']}"
-
     return {
-        "event": event,
+        "event": [event],
         "sms_results": sms_results,
-        "whatsapp_urls": wa_urls,
-        "dial_uri": dial_uri,
+        "whatsapp_urls": whatsapp_urls,
+        "dial_uri": f"tel:{first['phone']}",
         "first_contact": first,
         "disclaimer": "If this is life-threatening, call local emergency services immediately.",
     }
 
 
 @router.post("/sos/cancel")
-def sos_cancel(user: AuthUser = Depends(get_current_user)):
-    profile = get_profile_by_user_id(user.user_id)
-    sb = get_supabase()
-    # Mark latest pending/triggered as cancelled (client countdown cancel)
-    latest = (
-        sb.table("sos_events")
-        .select("id")
-        .eq("patient_id", profile["id"])
-        .order("created_at", desc=True)
-        .limit(1)
-        .execute()
-    ).data
+async def sos_cancel(
+    user: AuthUser = Depends(get_patient_user),
+    repository: MongoRepository = Depends(get_repository),
+):
+    profile = await repository.get_profile_by_user_id(user.user_id)
+    if not profile:
+        raise HTTPException(404, "Profile not found")
+    latest = await repository.find_one_patient_record(
+        "sos_events",
+        profile["id"],
+        sort=[("created_at", -1)],
+    )
     if latest:
-        sb.table("sos_events").update({"status": "cancelled"}).eq(
-            "id", latest[0]["id"]
-        ).execute()
+        await repository.update_patient_record(
+            "sos_events",
+            profile["id"],
+            latest["id"],
+            {"status": "cancelled"},
+        )
     return {"ok": True}

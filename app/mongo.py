@@ -27,6 +27,15 @@ INDEXES: tuple[tuple[str, list[tuple[str, int]], dict[str, Any]], ...] = (
         {"name": "dose_logs_patient_scheduled"},
     ),
     (
+        "dose_logs",
+        [
+            ("patient_id", ASCENDING),
+            ("medicine_id", ASCENDING),
+            ("scheduled_at", ASCENDING),
+        ],
+        {"unique": True, "name": "dose_logs_patient_medicine_scheduled_unique"},
+    ),
+    (
         "food_logs",
         [("patient_id", ASCENDING), ("logged_at", ASCENDING)],
         {"name": "food_logs_patient_logged"},

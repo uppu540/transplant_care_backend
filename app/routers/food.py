@@ -1,8 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from app.auth import AuthUser, get_current_user
-from app.db import get_profile_by_user_id, get_supabase
+from app.auth import AuthUser, get_patient_user
+from app.repository import MongoRepository, get_repository
 from app.services.food_estimate import estimate_from_text
 
 router = APIRouter(prefix="/food", tags=["food"])
@@ -25,27 +25,42 @@ class LogBody(BaseModel):
 
 
 @router.post("/estimate")
-def estimate(body: EstimateBody, user: AuthUser = Depends(get_current_user)):
-    get_profile_by_user_id(user.user_id)  # authz
-    return estimate_from_text(body.text)
+async def estimate(
+    body: EstimateBody,
+    user: AuthUser = Depends(get_patient_user),
+    repository: MongoRepository = Depends(get_repository),
+):
+    profile = await repository.get_profile_by_user_id(user.user_id)
+    if not profile:
+        raise HTTPException(404, "Profile not found")
+    return await estimate_from_text(body.text, repository)
 
 
 @router.post("/log")
-def log_food(body: LogBody, user: AuthUser = Depends(get_current_user)):
-    profile = get_profile_by_user_id(user.user_id)
-    sb = get_supabase()
+async def log_food(
+    body: LogBody,
+    user: AuthUser = Depends(get_patient_user),
+    repository: MongoRepository = Depends(get_repository),
+):
+    profile = await repository.get_profile_by_user_id(user.user_id)
+    if not profile:
+        raise HTTPException(404, "Profile not found")
     row = body.model_dump() if hasattr(body, "model_dump") else body.dict()
-    row["patient_id"] = profile["id"]
-    res = sb.table("food_logs").insert(row).execute()
-    return {"ok": True, "log": res.data}
+    log = await repository.insert_patient_record("food_logs", profile["id"], row)
+    return {"ok": True, "log": [log]}
 
 
 @router.get("/suggestions")
-def suggestions(user: AuthUser = Depends(get_current_user)):
+async def suggestions(
+    user: AuthUser = Depends(get_patient_user),
+    repository: MongoRepository = Depends(get_repository),
+):
     from app.ai.tools import get_daily_budget
 
-    profile = get_profile_by_user_id(user.user_id)
-    budget = get_daily_budget(profile["id"])
+    profile = await repository.get_profile_by_user_id(user.user_id)
+    if not profile:
+        raise HTTPException(404, "Profile not found")
+    budget = await get_daily_budget(profile["id"], repository)
     if not budget["limits_set"]:
         raise HTTPException(
             400,
@@ -53,8 +68,7 @@ def suggestions(user: AuthUser = Depends(get_current_user)):
         )
     remaining = budget["remaining"] or {}
     # Simple rule-based ideas from composition DB for MVP
-    sb = get_supabase()
-    foods = sb.table("food_composition").select("*").limit(40).execute().data or []
+    foods = await repository.list_food_composition(limit=40)
 
     def fits(f: dict) -> bool:
         checks = [

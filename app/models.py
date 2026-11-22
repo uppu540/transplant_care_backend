@@ -91,7 +91,7 @@ class FoodLogDocument(MongoDocument):
     patient_id: str
     description: str
     meal_type: str = "other"
-    logged_at: UTCDateTime | None = None
+    logged_at: UTCDateTime = Field(default_factory=lambda: datetime.now(timezone.utc))
     potassium_mg: float | None = None
     sodium_mg: float | None = None
     phosphorus_mg: float | None = None

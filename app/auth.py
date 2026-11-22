@@ -11,7 +11,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt import PyJWKClient
 
 from app.config import Settings, get_settings
-from app.mongo import get_mongo_database
+from app.repository import MongoRepository, get_repository
 
 security = HTTPBearer()
 
@@ -118,7 +118,7 @@ async def get_current_user(
     request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(security),
     settings: Settings = Depends(get_settings),
-    database=Depends(get_mongo_database),
+    repository: MongoRepository = Depends(get_repository),
 ) -> AuthUser:
     token = credentials.credentials
 
@@ -150,23 +150,31 @@ async def get_current_user(
     if not user_id:
         raise HTTPException(status_code=401, detail="Token missing subject")
 
-    if request.url.path not in ("/me/consent", "/auth/logout"):
-        user_record = await database["users"].find_one(
-            {"_id": user_id},
-            {"consent_version": 1, "consent_at": 1, "role": 1},
+    user_record = await repository.get_user(user_id)
+    if not user_record:
+        raise HTTPException(status_code=401, detail="Account no longer exists")
+    if request.url.path not in ("/me/consent", "/auth/logout") and (
+        not user_record.get("consent_version") or not user_record.get("consent_at")
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Medical consent is required before accessing data",
         )
-        if (
-            not user_record
-            or not user_record.get("consent_version")
-            or not user_record.get("consent_at")
-        ):
-            raise HTTPException(
-                status_code=403,
-                detail="Medical consent is required before accessing data",
-            )
 
     return AuthUser(
         user_id=user_id,
         email=payload.get("email"),
-        role=payload.get("role", "patient"),
+        role=user_record.get("role", payload.get("role", "patient")),
     )
+
+
+async def get_patient_user(user: AuthUser = Depends(get_current_user)) -> AuthUser:
+    if user.role != "patient":
+        raise HTTPException(status_code=403, detail="Patient access required")
+    return user
+
+
+async def get_caregiver_user(user: AuthUser = Depends(get_current_user)) -> AuthUser:
+    if user.role != "caregiver":
+        raise HTTPException(status_code=403, detail="Caregiver access required")
+    return user

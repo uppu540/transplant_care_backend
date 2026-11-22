@@ -11,6 +11,7 @@ from pymongo.errors import DuplicateKeyError
 from app.auth import AuthUser, create_access_token, get_current_user
 from app.config import Settings
 from app.rate_limit import rate_limit
+from app.repository import MongoRepository
 from app.routers import auth as auth_routes
 
 
@@ -164,7 +165,7 @@ def test_current_user_blocks_data_access_without_consent():
                 request=request,
                 credentials=_credentials(settings),
                 settings=settings,
-                database=database,
+                repository=MongoRepository(database),
             )
         )
 
@@ -187,7 +188,7 @@ def test_current_user_allows_consented_user_and_consent_route():
             request=SimpleNamespace(url=SimpleNamespace(path="/me/summary")),
             credentials=credentials,
             settings=settings,
-            database=FakeDatabase(consented_user),
+            repository=MongoRepository(FakeDatabase(consented_user)),
         )
     )
     assert user == AuthUser(user_id="user-1", email="patient@example.test", role="patient")
@@ -197,7 +198,7 @@ def test_current_user_allows_consented_user_and_consent_route():
             request=SimpleNamespace(url=SimpleNamespace(path="/me/consent")),
             credentials=credentials,
             settings=settings,
-            database=FakeDatabase({"_id": "user-1"}),
+            repository=MongoRepository(FakeDatabase({"_id": "user-1"})),
         )
     )
     assert consent_route_user.user_id == "user-1"
@@ -216,7 +217,7 @@ def test_test_tokens_are_development_only():
                 request=request,
                 credentials=credentials,
                 settings=_settings(),
-                database=FakeDatabase(),
+                repository=MongoRepository(FakeDatabase()),
             )
         )
     assert exc.value.status_code == 401
@@ -228,7 +229,7 @@ def test_test_tokens_are_development_only():
             request=request,
             credentials=credentials,
             settings=development_settings,
-            database=FakeDatabase(),
+            repository=MongoRepository(FakeDatabase({"_id": "user-1"})),
         )
     )
     assert user.user_id == "user-1"
@@ -239,9 +240,10 @@ def test_rate_limit_rejects_requests_over_limit():
     request = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))
     database = FakeDatabase()
 
-    asyncio.run(limiter(request=request, database=database))
+    repository = MongoRepository(database)
+    asyncio.run(limiter(request=request, repository=repository))
     with pytest.raises(HTTPException) as exc:
-        asyncio.run(limiter(request=request, database=database))
+        asyncio.run(limiter(request=request, repository=repository))
 
     assert exc.value.status_code == 429
     assert "Retry-After" in exc.value.headers
@@ -251,6 +253,7 @@ def test_register_login_and_single_use_refresh_token(monkeypatch):
     settings = _settings()
     monkeypatch.setattr(auth_routes, "get_settings", lambda: settings)
     database = MemoryDatabase()
+    repository = MongoRepository(database)
 
     registered = asyncio.run(
         auth_routes.register(
@@ -259,7 +262,7 @@ def test_register_login_and_single_use_refresh_token(monkeypatch):
                 password="a-strong-password",
                 full_name="Patient One",
             ),
-            database=database,
+            repository=repository,
         )
     )
     assert registered["role"] == "patient"
@@ -275,13 +278,13 @@ def test_register_login_and_single_use_refresh_token(monkeypatch):
                 email="patient@example.test",
                 password="a-strong-password",
             ),
-            database=database,
+            repository=repository,
         )
     )
     rotated = asyncio.run(
         auth_routes.refresh(
             auth_routes.RefreshBody(refresh_token=logged_in["refresh_token"]),
-            database=database,
+            repository=repository,
         )
     )
     assert rotated["refresh_token"] != logged_in["refresh_token"]
@@ -290,7 +293,7 @@ def test_register_login_and_single_use_refresh_token(monkeypatch):
         asyncio.run(
             auth_routes.refresh(
                 auth_routes.RefreshBody(refresh_token=logged_in["refresh_token"]),
-                database=database,
+                repository=repository,
             )
         )
     assert exc.value.status_code == 401

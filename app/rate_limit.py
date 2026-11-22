@@ -4,16 +4,14 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, HTTPException, Request
-from pymongo import ReturnDocument
-from pymongo.errors import DuplicateKeyError
 
-from app.mongo import get_mongo_database
+from app.repository import MongoRepository, get_repository
 
 
 def rate_limit(scope: str, max_requests: int, window_seconds: int = 900):
     async def enforce_rate_limit(
         request: Request,
-        database=Depends(get_mongo_database),
+        repository: MongoRepository = Depends(get_repository),
     ) -> None:
         now = datetime.now(timezone.utc)
         window_start = int(now.timestamp()) // window_seconds
@@ -25,26 +23,7 @@ def rate_limit(scope: str, max_requests: int, window_seconds: int = 900):
             (window_start + 1) * window_seconds,
             tz=timezone.utc,
         )
-        collection = database["rate_limits"]
-        try:
-            bucket = await collection.find_one_and_update(
-                {"_id": bucket_id},
-                {
-                    "$inc": {"count": 1},
-                    "$setOnInsert": {"expires_at": expires_at},
-                },
-                upsert=True,
-                return_document=ReturnDocument.AFTER,
-            )
-        except DuplicateKeyError:
-            bucket = await collection.find_one_and_update(
-                {"_id": bucket_id},
-                {"$inc": {"count": 1}},
-                return_document=ReturnDocument.AFTER,
-            )
-
-        if bucket is None:
-            raise RuntimeError("Failed to update rate limit counter")
+        bucket = await repository.increment_rate_limit(bucket_id, expires_at)
         if bucket["count"] > max_requests:
             retry_after = max(1, int((expires_at - now).total_seconds()))
             raise HTTPException(

@@ -1,15 +1,8 @@
-import pytest
+import asyncio
+
 from app.ai.red_flags import detect_red_flag, red_flag_message
 from app.ai.system_prompt import SYSTEM_PROMPT
-from app.ai.tools import get_daily_budget, execute_tool
-from app.db import get_supabase, SupabaseClient, set_supabase_client
-
-
-@pytest.fixture(autouse=True)
-def setup_mock_db():
-    client = SupabaseClient("http://mock.supabase.co", "mock-key")
-    set_supabase_client(client)
-    yield client
+from app.ai.tools import get_daily_budget
 
 
 def test_red_flag_symptoms_all_escalate():
@@ -51,10 +44,10 @@ def test_hard_safety_rule_system_prompt_contains_constraints():
     assert "IMMEDIATELY tell them to contact their doctor now" in SYSTEM_PROMPT
 
 
-def test_budget_null_limits_returns_limits_set_false():
+def test_budget_null_limits_returns_limits_set_false(mongo_repository):
     # If no doctor limits exist, limits_set must be False so AI cannot guess
     pid = "patient-unconfigured"
-    budget = get_daily_budget(pid)
+    budget = asyncio.run(get_daily_budget(pid, mongo_repository))
     assert budget["limits_set"] is False
     assert budget["limits"] is None
     assert budget["remaining"] is None

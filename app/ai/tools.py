@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
 
-from app.db import get_supabase
+from app.repository import MongoRepository
 
 TOOL_DEFINITIONS = [
     {
@@ -79,70 +78,32 @@ TOOL_DEFINITIONS = [
 ]
 
 
-def _today_bounds_iso() -> tuple[str, str]:
-    now = datetime.now(timezone.utc)
-    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    end = now.replace(hour=23, minute=59, second=59, microsecond=999999)
-    return start.isoformat(), end.isoformat()
+async def get_daily_budget(
+    patient_id: str,
+    repository: MongoRepository,
+) -> dict[str, Any]:
+    return await repository.get_daily_budget(patient_id)
 
 
-def get_daily_budget(patient_id: str) -> dict[str, Any]:
-    sb = get_supabase()
-    limits_res = (
-        sb.table("dietary_limits").select("*").eq("patient_id", patient_id).limit(1).execute()
-    )
-    limits = limits_res.data[0] if limits_res.data else None
-    start, end = _today_bounds_iso()
-    foods = (
-        sb.table("food_logs")
-        .select(
-            "potassium_mg,sodium_mg,phosphorus_mg,protein_g,fluid_ml,calories_kcal"
-        )
-        .eq("patient_id", patient_id)
-        .gte("logged_at", start)
-        .lte("logged_at", end)
-        .execute()
-    )
-
-    def sum_field(key: str) -> float:
-        return float(sum((row.get(key) or 0) for row in (foods.data or [])))
-
-    consumed = {
-        "potassium_mg": sum_field("potassium_mg"),
-        "sodium_mg": sum_field("sodium_mg"),
-        "phosphorus_mg": sum_field("phosphorus_mg"),
-        "protein_g": sum_field("protein_g"),
-        "fluid_ml": sum_field("fluid_ml"),
-        "calories_kcal": sum_field("calories_kcal"),
-    }
-
-    remaining = None
-    if limits:
-        remaining = {}
-        for key in consumed:
-            limit_val = limits.get(key)
-            remaining[key] = None if limit_val is None else float(limit_val) - consumed[key]
-
-    return {
-        "limits_set": limits is not None,
-        "limits": limits,
-        "consumed": consumed,
-        "remaining": remaining,
-    }
-
-
-def execute_tool(patient_id: str, name: str, args: dict[str, Any]) -> Any:
-    sb = get_supabase()
-
+async def execute_tool(
+    patient_id: str,
+    name: str,
+    args: dict[str, Any],
+    repository: MongoRepository,
+) -> Any:
     if name == "get_medicines":
-        res = (
-            sb.table("medicines")
-            .select("id,name,dose,schedule_times,notes,active")
-            .eq("patient_id", patient_id)
-            .eq("active", True)
-            .execute()
+        return await repository.find_patient_records(
+            "medicines",
+            patient_id,
+            filters={"active": True},
+            projection={
+                "name": 1,
+                "dose": 1,
+                "schedule_times": 1,
+                "notes": 1,
+                "active": 1,
+            },
         )
-        return res.data
 
     if name == "log_dose":
         status = args["status"]
@@ -150,28 +111,40 @@ def execute_tool(patient_id: str, name: str, args: dict[str, Any]) -> Any:
             return {"error": "status must be taken or skipped"}
         row = {
             "medicine_id": args["medicine_id"],
-            "patient_id": patient_id,
             "scheduled_at": args["scheduled_at"],
             "status": status,
         }
-        res = sb.table("dose_logs").upsert(row, on_conflict="medicine_id,scheduled_at").execute()
-        return {"ok": True, "log": res.data}
+        log = await repository.upsert_patient_record(
+            "dose_logs",
+            patient_id,
+            {
+                "medicine_id": args["medicine_id"],
+                "scheduled_at": args["scheduled_at"],
+            },
+            row,
+        )
+        return {"ok": True, "log": [log]}
 
     if name == "get_labs":
         limit = int(args.get("limit") or 20)
-        res = (
-            sb.table("lab_values")
-            .select("analyte,value,unit,ref_low,ref_high,out_of_range,measured_at")
-            .eq("patient_id", patient_id)
-            .order("measured_at", desc=True)
-            .limit(limit)
-            .execute()
+        return await repository.find_patient_records(
+            "lab_values",
+            patient_id,
+            projection={
+                "analyte": 1,
+                "value": 1,
+                "unit": 1,
+                "ref_low": 1,
+                "ref_high": 1,
+                "out_of_range": 1,
+                "measured_at": 1,
+            },
+            sort=[("measured_at", -1)],
+            limit=limit,
         )
-        return res.data
 
     if name == "log_food":
         row = {
-            "patient_id": patient_id,
             "description": args["description"],
             "meal_type": args.get("meal_type") or "other",
             "potassium_mg": args.get("potassium_mg"),
@@ -182,35 +155,29 @@ def execute_tool(patient_id: str, name: str, args: dict[str, Any]) -> Any:
             "calories_kcal": args.get("calories_kcal"),
             "estimate_source": "llm",
         }
-        res = sb.table("food_logs").insert(row).execute()
-        return {"ok": True, "log": res.data}
+        log = await repository.insert_patient_record("food_logs", patient_id, row)
+        return {"ok": True, "log": [log]}
 
     if name == "get_daily_budget":
-        return get_daily_budget(patient_id)
+        return await get_daily_budget(patient_id, repository)
 
     if name == "send_doctor_message":
-        profile = (
-            sb.table("profiles")
-            .select("full_name,doctor_name,doctor_whatsapp,transplant_date")
-            .eq("id", patient_id)
-            .single()
-            .execute()
-        ).data
-        meds = (
-            sb.table("medicines")
-            .select("name,dose")
-            .eq("patient_id", patient_id)
-            .eq("active", True)
-            .execute()
-        ).data
-        labs = (
-            sb.table("lab_values")
-            .select("analyte,value,unit,measured_at")
-            .eq("patient_id", patient_id)
-            .order("measured_at", desc=True)
-            .limit(8)
-            .execute()
-        ).data
+        profile = await repository.get_profile_by_id(patient_id)
+        if not profile:
+            return {"error": "Patient profile not found"}
+        meds = await repository.find_patient_records(
+            "medicines",
+            patient_id,
+            filters={"active": True},
+            projection={"name": 1, "dose": 1},
+        )
+        labs = await repository.find_patient_records(
+            "lab_values",
+            patient_id,
+            projection={"analyte": 1, "value": 1, "unit": 1, "measured_at": 1},
+            sort=[("measured_at", -1)],
+            limit=8,
+        )
         phone = (profile.get("doctor_whatsapp") or "").lstrip("+").replace(" ", "")
         if not phone:
             return {"error": "Doctor WhatsApp number not set"}

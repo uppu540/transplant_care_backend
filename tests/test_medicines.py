@@ -1,95 +1,113 @@
-from datetime import datetime, timezone, timedelta
-import pytest
-from app.db import get_supabase, SupabaseClient, set_supabase_client
-from app.routers.medicines import log_dose, adherence, check_missed_doses, LogDoseBody
+import asyncio
+from datetime import datetime, timezone
+
 from app.auth import AuthUser
+from app.routers import medicines
+from app.routers.medicines import (
+    LogDoseBody,
+    adherence,
+    check_missed_doses,
+    log_dose,
+)
 
 
-@pytest.fixture(autouse=True)
-def setup_mock_db():
-    client = SupabaseClient("http://mock.supabase.co", "mock-key")
-    set_supabase_client(client)
-    yield client
-
-
-def test_log_dose_and_adherence():
-    sb = get_supabase()
-    user_id = "user-med-test"
-    prof_res = sb.table("profiles").insert(
-        {"user_id": user_id, "full_name": "Suresh"}
-    ).execute()
-    pid = prof_res.data[0]["id"]
-
-    med_res = sb.table("medicines").insert(
-        {
-            "patient_id": pid,
-            "name": "Prednisolone",
-            "dose": "5mg",
-            "schedule_times": ["08:00:00"],
-            "active": True,
-        }
-    ).execute()
-    med_id = med_res.data[0]["id"]
-
-    user = AuthUser(user_id=user_id)
+def test_log_dose_and_adherence(mongo_repository, profile_factory):
+    profile = profile_factory("user-med-test", full_name="Suresh")
+    patient_id = profile["id"]
+    medicine = asyncio.run(
+        mongo_repository.insert_patient_record(
+            "medicines",
+            patient_id,
+            {
+                "name": "Prednisolone",
+                "dose": "5mg",
+                "schedule_times": ["08:00:00"],
+                "active": True,
+            },
+        )
+    )
+    user = AuthUser(user_id="user-med-test")
     now = datetime.now(timezone.utc)
 
-    # Log 1 taken dose
-    res1 = log_dose(
-        med_id,
-        LogDoseBody(status="taken", scheduled_at=now - timedelta(days=1)),
-        user=user,
+    taken = asyncio.run(
+        log_dose(
+            medicine["id"],
+            LogDoseBody(status="taken", scheduled_at=now.replace(hour=8)),
+            user=user,
+            repository=mongo_repository,
+        )
     )
-    assert res1["ok"] is True
-
-    # Log 1 skipped dose
-    res2 = log_dose(
-        med_id,
-        LogDoseBody(status="skipped", scheduled_at=now),
-        user=user,
+    skipped = asyncio.run(
+        log_dose(
+            medicine["id"],
+            LogDoseBody(status="skipped", scheduled_at=now.replace(hour=9)),
+            user=user,
+            repository=mongo_repository,
+        )
     )
-    assert res2["ok"] is True
+    assert taken["ok"] is True
+    assert skipped["ok"] is True
 
-    adh = adherence(user=user)
-    assert adh["total"] == 2
-    assert adh["taken"] == 1
-    assert adh["skipped"] == 1
-    assert adh["adherence_rate"] == 0.5
+    result = asyncio.run(adherence(user=user, repository=mongo_repository))
+    assert result["total"] == 2
+    assert result["taken"] == 1
+    assert result["skipped"] == 1
+    assert result["adherence_rate"] == 0.5
 
 
-def test_missed_dose_detection_and_alerts():
-    sb = get_supabase()
-    user_id = "user-missed-meds"
-    prof_res = sb.table("profiles").insert(
-        {"user_id": user_id, "full_name": "Lakshmi"}
-    ).execute()
-    pid = prof_res.data[0]["id"]
+def test_missed_dose_detection_and_alerts(
+    mongo_repository,
+    profile_factory,
+    monkeypatch,
+):
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 11, 22, 18, 0, tzinfo=timezone.utc)
 
-    # Emergency contact for alert
-    sb.table("emergency_contacts").insert(
-        {
-            "patient_id": pid,
-            "full_name": "Caregiver Venkat",
-            "phone": "+919999988888",
-            "sort_order": 0,
-        }
-    ).execute()
+    monkeypatch.setattr(medicines, "datetime", FixedDateTime)
+    monkeypatch.setattr(
+        medicines,
+        "send_sms",
+        lambda phone, message: {"ok": True, "dry_run": True},
+    )
+    profile = profile_factory("user-missed-meds", full_name="Lakshmi")
+    patient_id = profile["id"]
+    asyncio.run(
+        mongo_repository.insert_patient_record(
+            "emergency_contacts",
+            patient_id,
+            {
+                "full_name": "Caregiver Venkat",
+                "phone": "+919999988888",
+                "sort_order": 0,
+            },
+        )
+    )
+    asyncio.run(
+        mongo_repository.insert_patient_record(
+            "medicines",
+            patient_id,
+            {
+                "name": "Cyclosporine",
+                "dose": "50mg",
+                "schedule_times": ["06:00:00"],
+                "active": True,
+            },
+        )
+    )
 
-    # Active medicine scheduled at 06:00 AM (clearly past the grace period today)
-    sb.table("medicines").insert(
-        {
-            "patient_id": pid,
-            "name": "Cyclosporine",
-            "dose": "50mg",
-            "schedule_times": ["06:00:00"],
-            "active": True,
-        }
-    ).execute()
-
-    user = AuthUser(user_id=user_id)
-    # Check missed doses with 30 min grace period
-    result = check_missed_doses(grace_minutes=30, user=user)
+    result = asyncio.run(
+        check_missed_doses(
+            grace_minutes=30,
+            user=AuthUser(user_id="user-missed-meds"),
+            repository=mongo_repository,
+        )
+    )
     assert result["ok"] is True
-    # If current UTC hour is > 06:30, it triggers a missed dose
-    # Regardless of time of day, verify check_missed_doses executed without error
-    assert isinstance(result["missed_doses"], list)
+    assert len(result["missed_doses"]) == 1
+    logs = asyncio.run(
+        mongo_repository.find_patient_records("dose_logs", patient_id)
+    )
+    assert len(logs) == 1
+    assert logs[0]["status"] == "missed"
