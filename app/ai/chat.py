@@ -40,8 +40,8 @@ def _call_claude(
 async def run_chat(
     patient_id: str,
     message: str,
-    locale: str = "en",
     repository: MongoRepository,
+    locale: str = "en",
 ) -> dict[str, Any]:
     if detect_red_flag(message):
         reply = red_flag_message(locale)

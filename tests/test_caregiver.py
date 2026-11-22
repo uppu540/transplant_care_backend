@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi import HTTPException
@@ -108,3 +109,65 @@ def test_caregiver_flow_end_to_end(
             )
         )
     assert exc.value.status_code == 403
+
+
+def test_expired_and_reused_invite_codes_are_rejected(
+    mongo_repository,
+    mongo_database,
+    profile_factory,
+    user_factory,
+):
+    patient_id = "invite-patient"
+    profile_factory(patient_id)
+    user_factory(patient_id, "invite-patient@example.test")
+    caregiver_id = "invite-caregiver"
+    profile_factory(caregiver_id, role="caregiver")
+    user_factory(caregiver_id, "invite-caregiver@example.test", role="caregiver")
+
+    expired_invite = asyncio.run(
+        create_caregiver_invite(
+            user=AuthUser(user_id=patient_id),
+            repository=mongo_repository,
+        )
+    )
+    asyncio.run(
+        mongo_database["caregiver_links"].update_one(
+            {"invite_code": expired_invite["invite_code"]},
+            {"$set": {"expires_at": datetime.now(timezone.utc) - timedelta(seconds=1)}},
+        )
+    )
+    with pytest.raises(HTTPException) as expired_error:
+        asyncio.run(
+            accept_caregiver_invite(
+                AcceptInviteBody(invite_code=expired_invite["invite_code"]),
+                user=AuthUser(user_id=caregiver_id, role="caregiver"),
+                repository=mongo_repository,
+            )
+        )
+    assert expired_error.value.status_code == 404
+
+    valid_invite = asyncio.run(
+        create_caregiver_invite(
+            user=AuthUser(user_id=patient_id),
+            repository=mongo_repository,
+        )
+    )
+    accept_body = AcceptInviteBody(invite_code=valid_invite["invite_code"])
+    accepted = asyncio.run(
+        accept_caregiver_invite(
+            accept_body,
+            user=AuthUser(user_id=caregiver_id, role="caregiver"),
+            repository=mongo_repository,
+        )
+    )
+    assert accepted["ok"] is True
+
+    with pytest.raises(HTTPException) as reused_error:
+        asyncio.run(
+            accept_caregiver_invite(
+                accept_body,
+                user=AuthUser(user_id=caregiver_id, role="caregiver"),
+                repository=mongo_repository,
+            )
+        )
+    assert reused_error.value.status_code == 404

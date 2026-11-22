@@ -6,110 +6,11 @@ import jwt
 import pytest
 from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
-from pymongo.errors import DuplicateKeyError
 
 from app.auth import AuthUser, create_access_token, get_current_user
 from app.config import Settings
 from app.rate_limit import rate_limit
-from app.repository import MongoRepository
 from app.routers import auth as auth_routes
-
-
-class FakeCollection:
-    def __init__(self, record=None):
-        self.record = record
-        self.count = 0
-
-    async def find_one(self, query, projection=None):
-        if self.record and self.record.get("_id") == query["_id"]:
-            return self.record
-        return None
-
-    async def find_one_and_update(
-        self,
-        query,
-        update,
-        upsert=False,
-        return_document=None,
-    ):
-        self.count += update["$inc"]["count"]
-        return {"_id": query["_id"], "count": self.count}
-
-
-class FakeDatabase:
-    def __init__(self, user=None):
-        self.collections = {
-            "users": FakeCollection(user),
-            "rate_limits": FakeCollection(),
-        }
-
-    def __getitem__(self, collection_name):
-        return self.collections[collection_name]
-
-
-class MemoryCollection:
-    def __init__(self):
-        self.records = []
-
-    async def insert_one(self, document):
-        if any(record.get("_id") == document.get("_id") for record in self.records):
-            raise DuplicateKeyError("duplicate _id")
-        if document.get("email") and any(
-            record.get("email") == document["email"] for record in self.records
-        ):
-            raise DuplicateKeyError("duplicate email")
-        self.records.append(dict(document))
-        return SimpleNamespace(inserted_id=document["_id"])
-
-    async def find_one(self, query, projection=None):
-        return next((dict(record) for record in self.records if self._matches(record, query)), None)
-
-    async def update_one(self, query, update):
-        record = next((record for record in self.records if self._matches(record, query)), None)
-        if record is None:
-            return SimpleNamespace(matched_count=0, modified_count=0)
-        record.update(update.get("$set", {}))
-        return SimpleNamespace(matched_count=1, modified_count=1)
-
-    async def find_one_and_update(
-        self,
-        query,
-        update,
-        upsert=False,
-        return_document=None,
-    ):
-        record = next((record for record in self.records if self._matches(record, query)), None)
-        if record is None:
-            if upsert:
-                record = {"_id": query["_id"], "count": 0}
-                self.records.append(record)
-            else:
-                return None
-        before = dict(record)
-        record.update(update.get("$set", {}))
-        for field, amount in update.get("$inc", {}).items():
-            record[field] = record.get(field, 0) + amount
-        record.update(update.get("$setOnInsert", {}) if before.get("count") == 0 else {})
-        return dict(record) if return_document else before
-
-    @staticmethod
-    def _matches(record, query):
-        for key, expected in query.items():
-            actual = record.get(key)
-            if isinstance(expected, dict) and "$gt" in expected:
-                if actual is None or actual <= expected["$gt"]:
-                    return False
-            elif actual != expected:
-                return False
-        return True
-
-
-class MemoryDatabase:
-    def __init__(self):
-        self.collections = {}
-
-    def __getitem__(self, collection_name):
-        return self.collections.setdefault(collection_name, MemoryCollection())
 
 
 def _settings():
@@ -121,14 +22,27 @@ def _settings():
     )
 
 
-def _credentials(settings):
+def _credentials(settings, user_id="user-1", role="patient"):
     token = create_access_token(
-        user_id="user-1",
+        user_id=user_id,
         email="patient@example.test",
-        role="patient",
+        role=role,
         settings=settings,
     )
     return HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+
+
+def _create_user(repository, user_id="user-1", role="patient", consented=False):
+    user = {
+        "_id": user_id,
+        "email": f"{user_id}@example.test",
+        "password_hash": "test-password-hash",
+        "role": role,
+        "consent_version": "v1" if consented else None,
+        "consent_at": datetime.now(timezone.utc) if consented else None,
+    }
+    asyncio.run(repository.create_user(user))
+    return user
 
 
 def test_access_token_has_short_lived_auth_claims():
@@ -139,7 +53,6 @@ def test_access_token_has_short_lived_auth_claims():
         role="patient",
         settings=settings,
     )
-
     payload = jwt.decode(
         token,
         settings.jwt_secret,
@@ -154,18 +67,17 @@ def test_access_token_has_short_lived_auth_claims():
     assert payload["exp"] - payload["iat"] == 15 * 60
 
 
-def test_current_user_blocks_data_access_without_consent():
+def test_current_user_blocks_data_access_without_consent(mongo_repository):
     settings = _settings()
-    request = SimpleNamespace(url=SimpleNamespace(path="/me/summary"))
-    database = FakeDatabase({"_id": "user-1"})
+    _create_user(mongo_repository)
 
     with pytest.raises(HTTPException) as exc:
         asyncio.run(
             get_current_user(
-                request=request,
+                request=SimpleNamespace(url=SimpleNamespace(path="/me/summary")),
                 credentials=_credentials(settings),
                 settings=settings,
-                repository=MongoRepository(database),
+                repository=mongo_repository,
             )
         )
 
@@ -173,38 +85,34 @@ def test_current_user_blocks_data_access_without_consent():
     assert "consent" in exc.value.detail.lower()
 
 
-def test_current_user_allows_consented_user_and_consent_route():
+def test_current_user_allows_consented_user_and_consent_route(mongo_repository):
     settings = _settings()
-    credentials = _credentials(settings)
-    consented_user = {
-        "_id": "user-1",
-        "consent_version": "v1",
-        "consent_at": datetime.now(timezone.utc),
-        "role": "patient",
-    }
-
+    _create_user(mongo_repository, consented=True)
     user = asyncio.run(
         get_current_user(
             request=SimpleNamespace(url=SimpleNamespace(path="/me/summary")),
-            credentials=credentials,
+            credentials=_credentials(settings),
             settings=settings,
-            repository=MongoRepository(FakeDatabase(consented_user)),
+            repository=mongo_repository,
         )
     )
     assert user == AuthUser(user_id="user-1", email="patient@example.test", role="patient")
 
+    unconsented_id = "consent-pending"
+    _create_user(mongo_repository, user_id=unconsented_id)
     consent_route_user = asyncio.run(
         get_current_user(
             request=SimpleNamespace(url=SimpleNamespace(path="/me/consent")),
-            credentials=credentials,
+            credentials=_credentials(settings, user_id=unconsented_id),
             settings=settings,
-            repository=MongoRepository(FakeDatabase({"_id": "user-1"})),
+            repository=mongo_repository,
         )
     )
-    assert consent_route_user.user_id == "user-1"
+    assert consent_route_user.user_id == unconsented_id
 
 
-def test_test_tokens_are_development_only():
+def test_test_tokens_are_development_only(mongo_repository):
+    _create_user(mongo_repository)
     credentials = HTTPAuthorizationCredentials(
         scheme="Bearer",
         credentials="test:user-1:patient@example.test",
@@ -217,7 +125,7 @@ def test_test_tokens_are_development_only():
                 request=request,
                 credentials=credentials,
                 settings=_settings(),
-                repository=MongoRepository(FakeDatabase()),
+                repository=mongo_repository,
             )
         )
     assert exc.value.status_code == 401
@@ -229,31 +137,30 @@ def test_test_tokens_are_development_only():
             request=request,
             credentials=credentials,
             settings=development_settings,
-            repository=MongoRepository(FakeDatabase({"_id": "user-1"})),
+            repository=mongo_repository,
         )
     )
     assert user.user_id == "user-1"
 
 
-def test_rate_limit_rejects_requests_over_limit():
+def test_rate_limit_rejects_requests_over_limit(mongo_repository):
     limiter = rate_limit("login", max_requests=1, window_seconds=900)
     request = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))
-    database = FakeDatabase()
 
-    repository = MongoRepository(database)
-    asyncio.run(limiter(request=request, repository=repository))
+    asyncio.run(limiter(request=request, repository=mongo_repository))
     with pytest.raises(HTTPException) as exc:
-        asyncio.run(limiter(request=request, repository=repository))
+        asyncio.run(limiter(request=request, repository=mongo_repository))
 
     assert exc.value.status_code == 429
     assert "Retry-After" in exc.value.headers
 
 
-def test_register_login_and_single_use_refresh_token(monkeypatch):
+def test_register_login_and_single_use_refresh_token(
+    mongo_repository,
+    monkeypatch,
+):
     settings = _settings()
     monkeypatch.setattr(auth_routes, "get_settings", lambda: settings)
-    database = MemoryDatabase()
-    repository = MongoRepository(database)
 
     registered = asyncio.run(
         auth_routes.register(
@@ -262,13 +169,13 @@ def test_register_login_and_single_use_refresh_token(monkeypatch):
                 password="a-strong-password",
                 full_name="Patient One",
             ),
-            repository=repository,
+            repository=mongo_repository,
         )
     )
     assert registered["role"] == "patient"
     assert registered["refresh_token"]
 
-    user = database["users"].records[0]
+    user = asyncio.run(mongo_repository.get_user(registered["user_id"]))
     assert user["email"] == "patient@example.test"
     assert user["password_hash"] != "a-strong-password"
 
@@ -278,13 +185,13 @@ def test_register_login_and_single_use_refresh_token(monkeypatch):
                 email="patient@example.test",
                 password="a-strong-password",
             ),
-            repository=repository,
+            repository=mongo_repository,
         )
     )
     rotated = asyncio.run(
         auth_routes.refresh(
             auth_routes.RefreshBody(refresh_token=logged_in["refresh_token"]),
-            repository=repository,
+            repository=mongo_repository,
         )
     )
     assert rotated["refresh_token"] != logged_in["refresh_token"]
@@ -293,7 +200,7 @@ def test_register_login_and_single_use_refresh_token(monkeypatch):
         asyncio.run(
             auth_routes.refresh(
                 auth_routes.RefreshBody(refresh_token=logged_in["refresh_token"]),
-                repository=repository,
+                repository=mongo_repository,
             )
         )
     assert exc.value.status_code == 401

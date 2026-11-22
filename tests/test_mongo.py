@@ -2,45 +2,32 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 
 from app.models import FoodLogDocument
-from app.mongo import INDEXES, ensure_indexes
+from app.mongo import ensure_indexes
 
 
-class FakeCollection:
-    def __init__(self):
-        self.indexes = []
+def test_required_indexes_are_created_in_mongo_database(mongo_database):
+    asyncio.run(ensure_indexes(mongo_database))
+    users = asyncio.run(mongo_database["users"].index_information())
+    invites = asyncio.run(mongo_database["caregiver_links"].index_information())
+    refresh_tokens = asyncio.run(
+        mongo_database["refresh_tokens"].index_information()
+    )
 
-    async def create_index(self, keys, **options):
-        self.indexes.append((keys, options))
-
-
-class FakeDatabase:
-    def __init__(self):
-        self.collections = {}
-
-    def __getitem__(self, name):
-        return self.collections.setdefault(name, FakeCollection())
-
-
-def test_ensure_indexes_creates_required_indexes():
-    database = FakeDatabase()
-
-    asyncio.run(ensure_indexes(database))
-
-    expected = {}
-    for collection_name, keys, options in INDEXES:
-        expected.setdefault(collection_name, []).append((keys, options))
-
-    for collection_name, indexes in expected.items():
-        assert database[collection_name].indexes == indexes
-
-    ttl = database["caregiver_links"].indexes[-1][1]
-    assert ttl["expireAfterSeconds"] == 0
-    assert database["users"].indexes[0][1]["unique"] is True
+    assert users["users_email_unique"]["unique"] is True
+    assert invites["caregiver_invite_code_unique"]["unique"] is True
+    assert invites["caregiver_invite_expiry_ttl"]["expireAfterSeconds"] == 0
+    assert refresh_tokens["refresh_token_expiry_ttl"]["expireAfterSeconds"] == 0
 
 
 def test_document_datetimes_are_stored_in_utc():
-    local_time = datetime(2026, 11, 22, 12, 0, tzinfo=timezone(timedelta(hours=5, minutes=30)))
-
+    local_time = datetime(
+        2026,
+        11,
+        22,
+        12,
+        0,
+        tzinfo=timezone(timedelta(hours=5, minutes=30)),
+    )
     doc = FoodLogDocument(
         patient_id="patient-1",
         description="lunch",
