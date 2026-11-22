@@ -65,9 +65,9 @@ async def check_supabase_connection():
             )
 
         return {
-            "status": "success" if response.status_code == 200 else "error",
-            "supabase_http_status": response.status_code,
-            "supabase_connected": response.status_code == 200
+            "status": "reachable",
+            "http_status": response.status_code,
+            "response_body": response.text[:500]
         }
 
     except httpx.RequestError as error:
