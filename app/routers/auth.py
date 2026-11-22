@@ -11,13 +11,12 @@ from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 from app.auth import AuthUser, create_access_token, get_current_user
 from app.config import get_settings
-from app.mongo import get_mongo_database
 from app.rate_limit import rate_limit
+from app.repository import MongoRepository, get_repository
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 password_hasher = PasswordHasher()
@@ -58,7 +57,7 @@ def _require_jwt_configuration() -> None:
         )
 
 
-async def _issue_session(user: dict, database) -> dict:
+async def _issue_session(user: dict, repository: MongoRepository) -> dict:
     settings = get_settings()
     access_token = create_access_token(
         user_id=user["_id"],
@@ -68,7 +67,7 @@ async def _issue_session(user: dict, database) -> dict:
     )
     refresh_token = secrets.token_urlsafe(48)
     now = datetime.now(timezone.utc)
-    await database["refresh_tokens"].insert_one(
+    await repository.add_refresh_token(
         {
             "_id": str(uuid4()),
             "user_id": user["_id"],
@@ -87,7 +86,10 @@ async def _issue_session(user: dict, database) -> dict:
 
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
-async def register(body: RegisterBody, database=Depends(get_mongo_database)):
+async def register(
+    body: RegisterBody,
+    repository: MongoRepository = Depends(get_repository),
+):
     _require_jwt_configuration()
     email = _normalize_email(body.email)
     full_name = body.full_name.strip()
@@ -104,11 +106,11 @@ async def register(body: RegisterBody, database=Depends(get_mongo_database)):
         "consent_at": None,
     }
     try:
-        await database["users"].insert_one(user)
+        await repository.create_user(user)
     except DuplicateKeyError as exc:
         raise HTTPException(status_code=409, detail="Email is already registered") from exc
 
-    await database["profiles"].insert_one(
+    await repository.create_profile(
         {
             "_id": str(uuid4()),
             "user_id": user_id,
@@ -116,7 +118,7 @@ async def register(body: RegisterBody, database=Depends(get_mongo_database)):
             "role": body.role,
         }
     )
-    session = await _issue_session(user, database)
+    session = await _issue_session(user, repository)
     return {"user_id": user_id, "role": body.role, **session}
 
 
@@ -126,11 +128,11 @@ async def register(body: RegisterBody, database=Depends(get_mongo_database)):
 )
 async def login(
     body: LoginBody,
-    database=Depends(get_mongo_database),
+    repository: MongoRepository = Depends(get_repository),
 ):
     _require_jwt_configuration()
     email = _normalize_email(body.email)
-    user = await database["users"].find_one({"email": email})
+    user = await repository.get_user_by_email(email)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid email or password")
     try:
@@ -139,35 +141,30 @@ async def login(
         raise HTTPException(status_code=401, detail="Invalid email or password")
     if password_hasher.check_needs_rehash(user["password_hash"]):
         user["password_hash"] = password_hasher.hash(body.password)
-        await database["users"].update_one(
-            {"_id": user["_id"]},
-            {"$set": {"password_hash": user["password_hash"]}},
+        await repository.update_user(
+            user["_id"],
+            {"password_hash": user["password_hash"]},
         )
-    session = await _issue_session(user, database)
+    session = await _issue_session(user, repository)
     return {"user_id": user["_id"], "role": user.get("role", "patient"), **session}
 
 
 @router.post("/refresh")
-async def refresh(body: RefreshBody, database=Depends(get_mongo_database)):
+async def refresh(
+    body: RefreshBody,
+    repository: MongoRepository = Depends(get_repository),
+):
     _require_jwt_configuration()
     now = datetime.now(timezone.utc)
     token_hash = _hash_refresh_token(body.refresh_token)
-    record = await database["refresh_tokens"].find_one_and_update(
-        {
-            "token_hash": token_hash,
-            "revoked_at": None,
-            "expires_at": {"$gt": now},
-        },
-        {"$set": {"revoked_at": now}},
-        return_document=ReturnDocument.BEFORE,
-    )
+    record = await repository.rotate_refresh_token(token_hash, now)
     if not record:
         raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
 
-    user = await database["users"].find_one({"_id": record["user_id"]})
+    user = await repository.get_user(record["user_id"])
     if not user:
         raise HTTPException(status_code=401, detail="Account no longer exists")
-    session = await _issue_session(user, database)
+    session = await _issue_session(user, repository)
     return {"user_id": user["_id"], "role": user.get("role", "patient"), **session}
 
 
@@ -175,15 +172,12 @@ async def refresh(body: RefreshBody, database=Depends(get_mongo_database)):
 async def logout(
     body: RefreshBody,
     user: AuthUser = Depends(get_current_user),
-    database=Depends(get_mongo_database),
+    repository: MongoRepository = Depends(get_repository),
 ):
-    result = await database["refresh_tokens"].update_one(
-        {
-            "user_id": user.user_id,
-            "token_hash": _hash_refresh_token(body.refresh_token),
-            "revoked_at": None,
-        },
-        {"$set": {"revoked_at": datetime.now(timezone.utc)}},
+    result = await repository.revoke_refresh_token(
+        user.user_id,
+        _hash_refresh_token(body.refresh_token),
+        datetime.now(timezone.utc),
     )
     if result.modified_count != 1:
         raise HTTPException(status_code=401, detail="Invalid or already revoked refresh token")
